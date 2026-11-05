@@ -41,6 +41,32 @@ Music Bridge 就是把这条链子接起来的调度台：歌单链接进来，�
 
 出问题先查这两处：下载不动，多半是 wrapper 没启动或者登录掉了，先确认 `http://127.0.0.1:12340` 有没有响应；“开始导入”点不了，是设备没被认出来，检查 iPod 里有没有 `.rockbox` 或 `iPod_Control`，再看 `Music` 目录可不可写。
 
+## 懒得自己配？让 Codex 帮你
+
+上面七步自己走没问题，就是有点繁。也可以把下面这段话复制给 Codex（或者任何一个会写代码、能在你电脑上干活的 AI），让它一步一步带着你配。账号登录那一步它不能替你做，到时候它会停下来让你自己登，这是故意的。
+
+> 帮我在这台 Mac 上把 Music Bridge 跑起来。仓库是 https://github.com/ZexinLiu725/music-bridge ，先把它的 README 从头读完，再按下面的顺序做，每一步做完向我报告结果，不要跳步：
+>
+> 1. 检查环境：macOS 版本、芯片型号、Swift 版本、Xcode 命令行工具是否齐全，再确认 ImageMagick 和 ffmpeg（ffprobe）装没装。缺什么先告诉我，装任何东西之前要我点头。
+> 2. 把仓库 clone 到本地，按 README 的“构建与启动”编译并运行 --verify，把应用打开给我看。构建有警告先记下来，不要顺手改代码。
+> 3. 帮我准备下载工具：amdl（https://github.com/zhaarey/apple-music-downloader ）和 wrapper-lite（https://github.com/WorldObservationLog/wrapper/tree/lite ）按它们各自仓库的说明安装。wrapper 需要登录 Apple ID，这一步停下来，让我自己在终端里跑登录脚本，你不要问我的账号、密码或验证码，也不要代我输入。
+> 4. 等我登录完，你检查 wrapper 服务在 http://127.0.0.1:12340 是否正常响应，然后带我打开 Music Bridge 的“连接设置…”，把 amdl 路径、下载工作目录和 wrapper 地址填好。
+> 5. 打开工作目录里的 config.yaml，把 alac-max 改成 48000 再保存，改之前先把原文件备份一份。这个设置是把下载的无损采样率封顶在 48 kHz，因为我要把歌导入装了 Rockbox 完全体固件的 iPod，那台机器吃 48 以内的文件最稳。
+> 6. 先拿一张歌少的歌单小批量试：我把链接给你，你走下载，盯着日志，告诉我匹配成功几首、跳过几首、跳过的原因是什么。
+> 7. 导入 iPod 之前必须先问我，得到我明确同意才点“开始导入”。导入完把报告念给我听：导入几首、已存在几首、无法播放几首。任何要覆盖、删除设备上已有文件的动作，都先停下来问我。
+
+英文版（For English speakers）:
+
+> Help me set up Music Bridge on this Mac. The repo is https://github.com/ZexinLiu725/music-bridge — read its README first, then follow these steps in order and report back after each one. Do not skip steps.
+>
+> 1. Check the environment: macOS version, chip, Swift version, Xcode Command Line Tools, and whether ImageMagick and ffmpeg (ffprobe) are installed. Tell me what is missing and ask before installing anything.
+> 2. Clone the repo, build it as described in the README, run the verify script, and open the app so I can see it. Note any build warnings; do not change code to silence them.
+> 3. Prepare the download tools: install amdl (https://github.com/zhaarey/apple-music-downloader) and wrapper-lite (https://github.com/WorldObservationLog/wrapper/tree/lite) following their own repos. The wrapper requires an Apple ID sign-in: stop there and let me run the login script myself in Terminal. Never ask for my account, password, or verification codes, and never type them for me.
+> 4. After I confirm I am signed in, check that the wrapper service answers at http://127.0.0.1:12340, then walk me through Music Bridge's Connection Settings and fill in the amdl path, the download working directory, and the wrapper address.
+> 5. In the working directory's config.yaml, back the file up first, then set alac-max to 48000 and save. This caps lossless downloads at 48 kHz, because I import into an iPod running the Rockbox Ultimate firmware, which plays files up to 48 kHz most reliably.
+> 6. Test with a small playlist first: I will give you the link; run the download, watch the log, and tell me how many songs matched, how many were skipped, and why.
+> 7. Always ask me before importing to the iPod, and only click "Start Import" after I explicitly agree. Afterwards, read me the report: how many imported, how many already existed, how many are unplayable. Stop and ask before anything overwrites or deletes files on the device.
+
 ## 可以做什么
 
 - 识别网易云歌单或 Apple Music 公开歌单链接。
