@@ -1,6 +1,6 @@
 # 来源与外部依赖
 
-本仓库公开 Music Bridge 的 Swift / AppKit 界面、iPod 文件导入逻辑、构建脚本和图标素材，采用根目录的 MIT 许可证。
+本仓库公开 Music Bridge 的 Swift / SwiftUI 界面、iPod 文件导入逻辑、构建脚本和图标素材，采用根目录的 MIT 许可证。
 
 ## 下载器与服务
 
