@@ -13,6 +13,7 @@ struct CatalogMatchResult: Sendable {
     let urls: [String]
     let matched: Int
     let skipped: [CatalogTrackQuery]
+    let tracks: [PlaylistSong]
 }
 
 enum AppleMusicCatalogError: LocalizedError {
@@ -51,20 +52,27 @@ struct AppleMusicCatalogClient: Sendable {
 
         let token = try await fetchDeveloperToken()
         var urls: [String] = []
+        var tracks: [PlaylistSong] = []
         var skipped: [CatalogTrackQuery] = []
         var seen = Set<String>()
         var lastSearchError: Error?
+        // A shared album requires the same album, not merely a similar song
+        // from a single, compilation, or another edition.
+        let requiredAlbum = export.playlist?.sourceURL.path == "/album" ? export.playlist?.name : nil
 
         for (index, query) in queries.enumerated() {
             try Task.checkCancellation()
             do {
-                let match = try await search(query: query, token: token)
-                if let url = match?.url, seen.insert(url).inserted {
-                    urls.append(url)
+                let match = try await search(query: query, token: token, requiredAlbum: requiredAlbum)
+                if let match {
+                    let url = match.url
+                    if seen.insert(url).inserted { urls.append(url) }
+                    tracks.append(PlaylistSong(title: match.title, artist: match.artist, album: match.album))
                 } else {
                     skipped.append(query)
                 }
             } catch {
+                if Task.isCancelled || error is CancellationError { throw CancellationError() }
                 lastSearchError = error
                 skipped.append(query)
             }
@@ -74,7 +82,7 @@ struct AppleMusicCatalogClient: Sendable {
         if urls.isEmpty {
             throw lastSearchError ?? AppleMusicCatalogError.noMatches
         }
-        return CatalogMatchResult(urls: urls, matched: urls.count, skipped: skipped)
+        return CatalogMatchResult(urls: urls, matched: urls.count, skipped: skipped, tracks: tracks)
     }
 
     private func fetchDeveloperToken() async throws -> String {
@@ -102,7 +110,7 @@ struct AppleMusicCatalogClient: Sendable {
         return token
     }
 
-    private func search(query: CatalogTrackQuery, token: String) async throws -> CatalogSong? {
+    private func search(query: CatalogTrackQuery, token: String, requiredAlbum: String?) async throws -> CatalogSong? {
         var components = URLComponents(string: "https://amp-api.music.apple.com/v1/catalog/\(storefront)/search")!
         components.queryItems = [
             URLQueryItem(name: "term", value: "\(query.title) \(query.artist)".trimmingCharacters(in: .whitespaces)),
@@ -123,20 +131,30 @@ struct AppleMusicCatalogClient: Sendable {
         return candidates
             .compactMap { candidate in
                 guard let url = candidate.attributes.url else { return nil }
+                if let requiredAlbum {
+                    guard let album = candidate.attributes.albumName,
+                          normalize(album) == normalize(requiredAlbum) else { return nil }
+                }
                 let titleScore = similarity(query.title, candidate.attributes.name)
                 let artistScore = artistSimilarity(query.artist, candidate.attributes.artistName)
                 guard titleScore >= 0.70,
+                      Self.isLiveVersion(query.title) == Self.isLiveVersion(candidate.attributes.name + " " + (candidate.attributes.albumName ?? "")),
                       query.artist.isEmpty || artistScore >= 0.45 else { return nil }
                 let score = score(query: query, candidate: candidate)
                 return CatalogSong(
                     title: candidate.attributes.name,
                     artist: candidate.attributes.artistName,
+                    album: candidate.attributes.albumName,
                     url: url,
                     score: score
                 )
             }
             .filter { $0.score >= 0.72 }
             .max { $0.score < $1.score }
+    }
+
+    static func isLiveVersion(_ title: String) -> Bool {
+        title.range(of: "(?i)\\blive\\b|现场|現場|演唱会|演唱會", options: .regularExpression) != nil
     }
 
     private func score(query: CatalogTrackQuery, candidate: CatalogSearchSong) -> Double {
@@ -237,11 +255,13 @@ private struct CatalogSearchAttributes: Decodable {
     let name: String
     let artistName: String
     let url: String?
+    let albumName: String?
 }
 
 private struct CatalogSong: Sendable {
     let title: String
     let artist: String
+    let album: String?
     let url: String
     let score: Double
 }
