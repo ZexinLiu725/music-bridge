@@ -8,7 +8,7 @@
 
 > 当前为源码测试版，软件界面使用简体中文。真实歌单下载与实体 iPod 导入尚未完成端到端验证。
 
-![Music Bridge 最新主窗口，包含 macOS 原生红绿灯，当前未连接 iPod](docs/screenshots/music-bridge-main.jpg)
+![Music Bridge 最新主窗口，包含 macOS 原生红绿灯，当前未连接 iPod](docs/screenshots/music-bridge-main-v10.jpg)
 
 *在 Apple Silicon、macOS 27.2 上从实际运行的应用采集。画面为未连接设备、没有活动任务的状态。*
 
