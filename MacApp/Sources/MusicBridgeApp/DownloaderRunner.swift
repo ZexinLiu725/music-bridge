@@ -312,6 +312,14 @@ final class DownloaderRunner: NSObject {
         process = nil
     }
 
+    /// Terminate only the current amdl process while still delivering
+    /// onFinished, unlike stopDownloader(), which suppresses the callback
+    /// for an intentional stop. The per-song watchdog uses this when one
+    /// song stalls, so the queue can mark it timed out and move on.
+    func terminateCurrentDownload() {
+        process?.terminate()
+    }
+
     /// Stop both children, used when the user explicitly presses Stop.
     func stop() {
         generation = UUID()

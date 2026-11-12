@@ -6,6 +6,15 @@ struct PlaylistSong: Codable, Sendable, Equatable {
     let title: String
     let artist: String
     var album: String? = nil
+    /// NetEase track id and duration (milliseconds, the `dt` field), kept so
+    /// catalog matching can verify duration and later stages can refer back
+    /// to the source track. Optional: selections saved by older builds
+    /// decode unchanged without them.
+    var neteaseID: String? = nil
+    var durationMs: Int? = nil
+    /// The track's ID on its home platform for non-NetEase sources
+    /// (QQ songmid, Kugou hash). NetEase tracks keep using neteaseID.
+    var platformID: String? = nil
 }
 
 struct PlaylistSelection: Codable, Sendable, Equatable {
@@ -60,7 +69,8 @@ struct PlaylistSelection: Codable, Sendable, Equatable {
                 guard let trackID = (track["id"] as? NSNumber)?.stringValue,
                       let title = track["name"] as? String,
                       let artists = track["artists"] as? [[String: Any]] else { continue }
-                songs[trackID] = PlaylistSong(title: title, artist: artists.compactMap { $0["name"] as? String }.joined(separator: " & "))
+                songs[trackID] = PlaylistSong(title: title, artist: artists.compactMap { $0["name"] as? String }.joined(separator: " & "),
+                                              neteaseID: trackID, durationMs: (track["dt"] as? NSNumber)?.intValue)
             }
         }
         let ordered = ids.compactMap { songs[$0] }
@@ -86,7 +96,9 @@ struct PlaylistSelection: Codable, Sendable, Equatable {
                   let artists = track["ar"] as? [[String: Any]] else { return nil }
             let artist = artists.compactMap { $0["name"] as? String }.joined(separator: " & ")
             guard !artist.isEmpty else { return nil }
-            return PlaylistSong(title: title, artist: artist, album: name)
+            return PlaylistSong(title: title, artist: artist, album: name,
+                                neteaseID: (track["id"] as? NSNumber)?.stringValue,
+                                durationMs: (track["dt"] as? NSNumber)?.intValue)
         }
         guard songs.count == count else { throw PlaylistLibraryError.incompletePlaylist }
         return PlaylistSelection(id: id, name: name, sourceURL: URL(string: "https://music.163.com/album?id=\(id)")!,
@@ -106,7 +118,7 @@ enum PlaylistLibraryError: LocalizedError {
     case invalidPlaylist, incompletePlaylist, noLocalTracks, missingTools, conversionFailed, invalidPath
     var errorDescription: String? {
         switch self {
-        case .invalidPlaylist: return "无法读取网易云歌单或专辑，请检查分享链接。"
+        case .invalidPlaylist: return "无法读取歌单或专辑，请检查分享链接。"
         case .incompletePlaylist: return "歌单或专辑歌曲信息不完整，已停止处理，避免导入错误内容。"
         case .noLocalTracks: return "没有找到属于这份歌单的本地歌曲，请先完成下载。"
         case .missingTools: return "歌单导入需要 FFmpeg 和 ffprobe，请先安装。"
@@ -242,8 +254,117 @@ struct PlaylistLibrary: Sendable {
         return (files, missing, unmatched)
     }
 
-    func prepare(_ selection: PlaylistSelection, coverData: Data,
+    /// After a batch (playlist) download, the files in the batch folder carry
+    /// each song's own album track number (amdl's "{SongNumer}"), so the
+    /// folder cannot be browsed in playlist order. Renumber them by playlist
+    /// order — the same numbering `prepare` applies on import — matching
+    /// files to tracks by their embedded tags, not by the file names.
+    /// Best effort: any failure leaves the downloads untouched.
+    @discardableResult
+    func renumberBatchFolder(for selection: PlaylistSelection) -> (renamed: Int, unmatched: Int) {
+        guard let folderName = DownloaderRunner.sanitizedBatchFolder(selection.name) else { return (0, 0) }
+        let fm = FileManager.default
+        let downloadRoots = ((try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.lastPathComponent.hasPrefix("AM-DL") }
+        guard let folder = downloadRoots.map({ $0.appendingPathComponent(folderName) })
+            .first(where: { fm.fileExists(atPath: $0.path) }),
+            let entries = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey])
+        else { return (0, 0) }
+        let audioExtensions: Set<String> = ["m4a", "mp4", "mp3", "flac", "aac", "ogg", "opus", "wav"]
+        let audio = entries.filter { audioExtensions.contains($0.pathExtension.lowercased()) }
+        guard !audio.isEmpty else { return (0, 0) }
+        // Oldest download first: duplicates (same title and artist) resolve in
+        // the order the files landed, which is the order amdl got the URLs.
+        let tagged: [(url: URL, tags: [String: String])] = audio
+            .sorted {
+                let lhs = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+                let rhs = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+                return lhs < rhs
+            }
+            .compactMap { url in (try? metadata(url)).map { (url, $0) } }
+        var used = Set<String>()
+        var assignments: [(url: URL, ordinal: Int)] = []
+        for song in selection.tracks {
+            guard let candidate = tagged.first(where: { !used.contains($0.url.path) && Self.matches(song, tags: $0.tags) }) else { continue }
+            used.insert(candidate.url.path)
+            assignments.append((candidate.url, assignments.count + 1))
+        }
+        guard !assignments.isEmpty else { return (0, audio.count) }
+        let width = assignments.count > 99 ? 3 : 2
+        var staged: [(original: URL, temp: URL, dest: URL)] = []
+        var renamed = 0
+        do {
+            for (index, assignment) in assignments.enumerated() {
+                let stem = Self.playlistFileStem(assignment.url, ordinal: assignment.ordinal, width: width)
+                let dest = folder.appendingPathComponent(stem + "." + assignment.url.pathExtension)
+                if dest.standardizedFileURL.path == assignment.url.standardizedFileURL.path { renamed += 1; continue }
+                let temp = folder.appendingPathComponent(".renumber-\(index)-\(ProcessInfo.processInfo.globallyUniqueString)")
+                try fm.moveItem(at: assignment.url, to: temp)
+                staged.append((assignment.url, temp, dest))
+            }
+            for item in staged {
+                try fm.moveItem(at: item.temp, to: item.dest)
+                renamed += 1
+            }
+        } catch {
+            for item in staged.reversed() where fm.fileExists(atPath: item.temp.path) {
+                try? fm.moveItem(at: item.temp, to: item.original)
+            }
+            return (renamed, audio.count - assignments.count)
+        }
+        return (renamed, audio.count - assignments.count)
+    }
+
+    /// Songs ordered the way renumbering left them: by the numeric prefix
+    /// in each file name ("07. …"), unnumbered files last.
+    static func orderedAudioFiles(_ urls: [URL]) -> [URL] {
+        func ordinal(_ url: URL) -> Int {
+            let stem = url.deletingPathExtension().lastPathComponent
+            guard let dot = stem.firstIndex(of: "."), let value = Int(stem[..<dot]) else { return Int.max }
+            return value
+        }
+        return urls.sorted { ordinal($0) != ordinal($1) ? ordinal($0) < ordinal($1) : $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    static func m3uContent(name: String, files: [URL], tracks: [PlaylistSong]) -> String {
+        var lines = ["#EXTM3U", "#PLAYLIST:\(name)"]
+        for url in files {
+            let stem = url.deletingPathExtension().lastPathComponent
+            let title = stem.range(of: "^[0-9]+\\.\\s*", options: .regularExpression).map { String(stem[$0.upperBound...]) } ?? stem
+            let seconds = tracks.first { $0.title == title }?.durationMs.map { $0 / 1000 } ?? -1
+            lines.append("#EXTINF:\(seconds),\(title)")
+            lines.append(url.lastPathComponent)
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// Write a standard .m3u8 into the batch folder after a download, in
+    /// playlist order, so the folder works in any player — not only via
+    /// this app's iPod import.
+    @discardableResult
+    func writeM3U(for selection: PlaylistSelection) -> Int {
+        guard let folderName = DownloaderRunner.sanitizedBatchFolder(selection.name) else { return 0 }
+        let fm = FileManager.default
+        let downloadRoots = ((try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.lastPathComponent.hasPrefix("AM-DL") }
+        guard let folder = downloadRoots.map({ $0.appendingPathComponent(folderName) })
+            .first(where: { fm.fileExists(atPath: $0.path) }),
+              let entries = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else { return 0 }
+        let audioExtensions: Set<String> = ["m4a", "mp4", "mp3", "flac", "aac", "ogg", "opus", "wav"]
+        let audio = entries.filter { audioExtensions.contains($0.pathExtension.lowercased()) }
+        guard !audio.isEmpty else { return 0 }
+        let ordered = Self.orderedAudioFiles(audio)
+        let content = Self.m3uContent(name: selection.name, files: ordered, tracks: selection.tracks)
+        do { try content.write(to: folder.appendingPathComponent(folderName + ".m3u8"), atomically: true, encoding: .utf8) } catch { return 0 }
+        return ordered.count
+    }
+
+    func prepare(_ selection: PlaylistSelection, coverData: Data, coverMaxPixel: Int = 600,
                  progress: @Sendable (Int, Int, String) -> Void) throws -> PreparedPlaylist {
+        // The prepared-cache identity includes the cover size: 600px output
+        // is appearance 6; the 256px iPod size gets its own version so a
+        // settings change never reuses covers rendered at the other size.
+        let appearanceVersion = coverMaxPixel == 256 ? 7 : 6
         guard !selection.id.isEmpty, selection.id.allSatisfy(\.isNumber), !selection.name.isEmpty else { throw PlaylistLibraryError.invalidPlaylist }
         let service = IPodImporter()
         let all = service.audioFiles(in: root)
@@ -266,7 +387,7 @@ struct PlaylistLibrary: Sendable {
         let cacheFile = cacheRoot.appendingPathComponent("prepared.json")
         let sources = try selected.map { try CachedFile($0.item.url) }
         if let data = try? Data(contentsOf: cacheFile), let cache = try? JSONDecoder().decode(Cache.self, from: data),
-           cache.selection == selection, cache.sources == sources, cache.missing == missing, cache.appearanceVersion == 6,
+           cache.selection == selection, cache.sources == sources, cache.missing == missing, cache.appearanceVersion == appearanceVersion,
            cache.outputs.count == selected.count,
            cache.base.resolvingSymlinksInPath().path.hasPrefix(cacheRoot.resolvingSymlinksInPath().path + "/"),
            cache.cover.resolvingSymlinksInPath().path.hasPrefix(cache.base.resolvingSymlinksInPath().path + "/"),
@@ -309,7 +430,7 @@ struct PlaylistLibrary: Sendable {
                 "-map", "0:v:0", "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"]),
                let source = CGImageSourceCreateWithData(artwork as CFData, nil),
                let image = CGImageSourceCreateThumbnailAtIndex(source, 0,
-                   [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 600,
+                   [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: coverMaxPixel,
                     kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary),
                let writer = CGImageDestinationCreateWithURL(destination.deletingPathExtension().appendingPathExtension("jpg") as CFURL,
                    UTType.jpeg.identifier as CFString, 1, nil) {
@@ -324,7 +445,7 @@ struct PlaylistLibrary: Sendable {
             files.append((destination, base))
         }
         let cache = Cache(selection: selection, sources: sources, outputs: try files.map { try CachedFile($0.url) },
-                          base: base, cover: inputCover, missing: missing, appearanceVersion: 6)
+                          base: base, cover: inputCover, missing: missing, appearanceVersion: appearanceVersion)
         try JSONEncoder().encode(cache).write(to: cacheFile, options: .atomic)
         return PreparedPlaylist(files: files, originals: selected.map(\.item), missing: missing)
     }

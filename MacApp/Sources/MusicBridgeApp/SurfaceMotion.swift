@@ -19,12 +19,14 @@ struct SurfacePointer: Equatable {
     }
 }
 
-/// Opaque, shared colors keep focus changes and desktop wallpaper out of the palette.
+/// Light, opaque, shared colors in the shape of the calm desktop apps:
+/// a pale gray canvas, white cards, white inputs. Nothing translucent
+/// ever sits under text.
 enum SurfacePalette {
-    static let windowNSColor = NSColor(srgbRed: 78/255, green: 80/255, blue: 83/255, alpha: 1)
+    static let windowNSColor = NSColor(srgbRed: 242/255, green: 242/255, blue: 244/255, alpha: 1)
     static let window = Color(nsColor: windowNSColor)
-    static let card = Color(red: 52/255, green: 54/255, blue: 61/255)
-    static let input = Color(red: 35/255, green: 38/255, blue: 41/255)
+    static let card = Color(red: 255/255, green: 255/255, blue: 255/255)
+    static let input = Color(red: 255/255, green: 255/255, blue: 255/255)
 }
 
 struct WindowBackdrop: View {
@@ -51,7 +53,7 @@ private struct FloatingSurface: ViewModifier {
         content
             .background(SurfacePalette.card, in: shape)
             .overlay {
-                shape.strokeBorder(Color.white.opacity(contrast == .increased ? 0.4 : highlighted ? 0.14 : 0.065), lineWidth: 0.75)
+                shape.strokeBorder(Color.black.opacity(contrast == .increased ? 0.4 : highlighted ? 0.14 : 0.07), lineWidth: 0.75)
                     .allowsHitTesting(false)
             }
             .shadow(color: .black.opacity(0.08), radius: 6, x: 0, y: 3)

@@ -30,6 +30,16 @@ enum DownloadConfiguration {
         }
         return configuration + (configuration.hasSuffix("\n") ? "" : "\n") + replacement + "\n"
     }
+
+    static func settingEmbedLyrics(_ enabled: Bool, in configuration: String) -> String {
+        let replacement = "embed-lrc: \(enabled ? "true" : "false")"
+        if let range = configuration.range(of: "(?m)^embed-lrc:[^\\n]*", options: .regularExpression) {
+            var result = configuration
+            result.replaceSubrange(range, with: replacement)
+            return result
+        }
+        return configuration + (configuration.hasSuffix("\n") ? "" : "\n") + replacement + "\n"
+    }
 }
 
 enum AudioQuality: String, CaseIterable, Identifiable {

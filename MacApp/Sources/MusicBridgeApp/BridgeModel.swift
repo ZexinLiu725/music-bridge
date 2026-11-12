@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 enum PlaylistSource: Equatable {
-    case apple, netease
+    case apple, netease, qq, kugou
 
     static func extractURL(_ text: String) -> URL? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -11,7 +11,9 @@ enum PlaylistSource: Equatable {
             guard let range = Range(match.range, in: trimmed) else { continue }
             let raw = String(trimmed[range]).trimmingCharacters(in: CharacterSet(charactersIn: ".,;!?)"))
             if let url = URL(string: raw), let host = url.host?.lowercased(),
-               ["music.163.com", "163cn.tv", "music.apple.com"].contains(host),
+               ["music.163.com", "163cn.tv", "music.apple.com",
+                "y.qq.com", "i.y.qq.com", "i2.y.qq.com",
+                "www.kugou.com", "m.kugou.com", "kugou.com"].contains(host),
                url.user == nil, url.password == nil { return url }
         }
         return nil
@@ -25,8 +27,34 @@ enum PlaylistSource: Equatable {
            url.pathComponents.contains(where: { $0.hasPrefix("pl.") && $0.count > 3 }) { return .apple }
         if host == "music.163.com", ["playlist", "album"].contains(where: { url.path.contains($0) || (url.fragment ?? "").contains($0) }) { return .netease }
         if host == "163cn.tv" { return .netease }
+        if ["y.qq.com", "i.y.qq.com", "i2.y.qq.com"].contains(host),
+           url.path.contains("playlist") || url.path.contains("playsquare") { return .qq }
+        if host.hasSuffix("kugou.com"), url.path.contains("/special/") { return .kugou }
         return nil
     }
+}
+
+/// One skipped song with the closest catalog candidate the matcher
+/// rejected, presented in the review list for a manual decision.
+struct ReviewableSkip: Identifiable, Equatable {
+    let id: String
+    let jobID: String
+    let entryIndex: Int
+    let title: String
+    let artist: String
+    let candidateTitle: String
+    let candidateArtist: String
+    let candidateAlbum: String?
+    let reason: String
+    let score: Double
+}
+
+/// Which download channel a run tries first. Apple-first keeps the
+/// long-standing behaviour (catalog matching; NetEase only fills gaps).
+/// NetEase-first downloads straight from NetEase by track ID under the
+/// signed-in account's entitlements, and Apple matching fills the gaps.
+enum DownloadStrategy: String {
+    case appleFirst, neteaseFirst
 }
 
 @MainActor
@@ -47,6 +75,8 @@ final class BridgeModel: ObservableObject {
     @Published var failed = false
     @Published var settingsExpanded = false
     @Published var logsExpanded = false
+    @Published var reviewsExpanded = false
+    @Published private(set) var reviewableSkips: [ReviewableSkip] = []
     @Published var logs = ["Music Bridge 已就绪"]
     @Published var device: IPodDevice?
     @Published private(set) var availableDevices: [IPodDevice] = []
@@ -83,8 +113,23 @@ final class BridgeModel: ObservableObject {
     @Published var wrapperReady = false
     @Published var checkingService = false
     @Published var connectionDetail = "尚未检查本地服务"
+    @Published private(set) var neteaseNickname: String?
+    @Published private(set) var neteaseIsVIP = false
+    @Published private(set) var neteaseQRImage: NSImage?
+    @Published private(set) var neteaseLoginPhaseText = ""
+    private var neteaseCookieHeader: String?
+    private var neteaseLoginTask: Task<Void, Never>?
     @Published var originalCover: Bool {
         didSet { preferences.set(originalCover, forKey: "originalCover") }
+    }
+    @Published var ipodCover256: Bool {
+        didSet { preferences.set(ipodCover256, forKey: "ipodCover256") }
+    }
+    @Published var fallbackEnabled: Bool {
+        didSet { preferences.set(fallbackEnabled, forKey: "fallbackSourceEnabled") }
+    }
+    @Published var downloadStrategy: DownloadStrategy {
+        didSet { preferences.set(downloadStrategy.rawValue, forKey: "downloadStrategy") }
     }
     @Published var quality: AudioQuality {
         didSet { preferences.set(quality.rawValue, forKey: "audioQuality") }
@@ -98,6 +143,16 @@ final class BridgeModel: ObservableObject {
     private var generation = UUID()
     private var snapshot: [URL: FileSignature] = [:]
     private var progressMonitor: Task<Void, Never>?
+    private var downloadJob: DownloadJob?
+    /// Why NetEase could not serve a track in NetEase-first mode, keyed by
+    /// track ID, so wrap-up can annotate the ledger instead of retrying a
+    /// download that cannot succeed.
+    private var neteasePrefetchNotes: [String: String] = [:]
+    private var jobCurrentIndex: Int?
+    private var jobBaseline: [URL: FileSignature] = [:]
+    private var songWatchdog: Task<Void, Never>?
+    private var songTimedOut = false
+    private var lastDownloadActivity = Date()
     private let preferences: UserDefaults
     private let deviceProvider: () -> [IPodDevice]
     private let usesSystemDeviceProvider: Bool
@@ -118,9 +173,15 @@ final class BridgeModel: ObservableObject {
         self.deviceProvider = deviceProvider ?? { IPodImporter().mountedDevices() }
         usesSystemDeviceProvider = deviceProvider == nil
         originalCover = preferences.object(forKey: "originalCover") as? Bool ?? true
+        ipodCover256 = preferences.object(forKey: "ipodCover256") as? Bool ?? true
+        fallbackEnabled = preferences.object(forKey: "fallbackSourceEnabled") as? Bool ?? true
+        downloadStrategy = DownloadStrategy(rawValue: preferences.string(forKey: "downloadStrategy") ?? "") ?? .appleFirst
         // Default to the 48 kHz lossless tier: higher sample rates stutter on
         // the iPod Classic, so Hi-Res is an explicit choice, never the default.
         quality = AudioQuality(rawValue: preferences.string(forKey: "audioQuality") ?? "") ?? .lossless
+        neteaseCookieHeader = preferences.string(forKey: "neteaseCookieHeader")
+        neteaseNickname = preferences.string(forKey: "neteaseNickname")
+        neteaseIsVIP = (preferences.object(forKey: "neteaseVipType") as? Int ?? 0) > 0
         if !usesSystemDeviceProvider {
             selectedPlaylist = PlaylistLibrary(root: root).load()
             nativeTask = NativeImportTask.load(root: root)
@@ -147,6 +208,9 @@ final class BridgeModel: ObservableObject {
             deviceTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
                 Task { @MainActor in self?.requestDeviceRefresh() }
             }
+        }
+        if neteaseCookieHeader != nil {
+            Task { @MainActor in await self.refreshNeteaseAccount() }
         }
     }
 
@@ -398,10 +462,122 @@ final class BridgeModel: ObservableObject {
         else if detail.contains("播放列表") { percent = 95 }
     }
 
+    // MARK: NetEase account
+
+    func startNeteaseLogin() {
+        guard !shutDown else { return }
+        neteaseLoginTask?.cancel()
+        neteaseLoginPhaseText = "正在生成二维码…"
+        neteaseLoginTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let client = NeteaseAccountClient()
+                let qr = try await client.createLoginQR()
+                guard !Task.isCancelled, !shutDown else { return }
+                neteaseQRImage = qr.image
+                neteaseLoginPhaseText = "请用网易云音乐 App 扫码登录"
+                var confirmedPolls = 0
+                var lastPollDebug = ""
+                for _ in 0..<110 {
+                    try await Task.sleep(nanoseconds: 2_500_000_000)
+                    guard !Task.isCancelled, !shutDown else { return }
+                    let poll = await client.pollLogin(key: qr.key)
+                    if poll.debug != lastPollDebug {
+                        lastPollDebug = poll.debug
+                        log("网易云登录\(poll.debug)")
+                    }
+                    switch poll.result {
+                    case .waiting:
+                        continue
+                    case .scanned:
+                        neteaseLoginPhaseText = "已扫码，请在手机上确认登录"
+                    case .confirmed:
+                        confirmedPolls += 1
+                        neteaseLoginPhaseText = "已在手机确认，正在完成登录…"
+                        if confirmedPolls >= 4 {
+                            neteaseQRImage = nil
+                            neteaseLoginPhaseText = ""
+                            log("手机已确认，但网易云没有把登录会话发回来；请取消后重新扫码。若反复出现，把这条日志告诉小包包。")
+                            return
+                        }
+                    case .expired:
+                        neteaseQRImage = nil
+                        neteaseLoginPhaseText = ""
+                        log("网易云登录二维码已过期，请重新点扫码登录。")
+                        return
+                    case .blocked(let message):
+                        neteaseQRImage = nil
+                        neteaseLoginPhaseText = ""
+                        log("网易云登录被风控拦截：\(message)。可以先在这台 Mac 的浏览器里登录一次 music.163.com 再回来扫码，或稍后再试。")
+                        return
+                    case .success(let cookie):
+                        neteaseCookieHeader = cookie
+                        preferences.set(cookie, forKey: "neteaseCookieHeader")
+                        neteaseQRImage = nil
+                        neteaseLoginPhaseText = ""
+                        await refreshNeteaseAccount()
+                        return
+                    }
+                }
+                neteaseQRImage = nil
+                neteaseLoginPhaseText = ""
+                log("网易云登录超时，请重试。")
+            } catch {
+                if error is CancellationError { return }
+                guard !Task.isCancelled, !shutDown else { return }
+                neteaseQRImage = nil
+                neteaseLoginPhaseText = ""
+                log("网易云登录失败：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    func cancelNeteaseLogin() {
+        neteaseLoginTask?.cancel()
+        neteaseQRImage = nil
+        neteaseLoginPhaseText = ""
+    }
+
+    func logoutNetease() {
+        cancelNeteaseLogin()
+        neteaseCookieHeader = nil
+        neteaseNickname = nil
+        neteaseIsVIP = false
+        preferences.removeObject(forKey: "neteaseCookieHeader")
+        preferences.removeObject(forKey: "neteaseNickname")
+        preferences.removeObject(forKey: "neteaseVipType")
+        log("已退出网易云登录。")
+    }
+
+    func refreshNeteaseAccount() async {
+        guard let cookie = neteaseCookieHeader, !cookie.isEmpty else { return }
+        do {
+            let profile = try await NeteaseAccountClient().fetchProfile(cookieHeader: cookie)
+            neteaseNickname = profile.nickname
+            neteaseIsVIP = profile.isVIP
+            preferences.set(profile.nickname, forKey: "neteaseNickname")
+            preferences.set(profile.vipType, forKey: "neteaseVipType")
+            log("网易云已登录：\(profile.nickname)（\(profile.isVIP ? "黑胶 VIP" : "普通账号")）；网易云通道将按此账号权益取流。")
+        } catch {
+            log("网易云登录状态校验失败（登录可能已过期）：\(error.localizedDescription)")
+        }
+    }
+
     func checkService() async {
         guard !checkingService, !shutDown else { return }
         checkingService = true
         defer { checkingService = false }
+        // Component self-check first: a live wrapper is useless if the
+        // downloader binary or its launcher is missing from the folder.
+        let files = FileManager.default
+        var missing: [String] = []
+        if !files.isExecutableFile(atPath: root.appendingPathComponent("amdl").path) { missing.append("下载器 amdl") }
+        if !files.fileExists(atPath: root.appendingPathComponent("work/wrapper-lite-macos/start-local.sh").path) { missing.append("解密服务启动脚本") }
+        if !missing.isEmpty {
+            wrapperReady = false
+            connectionDetail = "组件缺失：\(missing.joined(separator: "、"))"
+            return
+        }
         do {
             var request = URLRequest(url: URL(string: "http://127.0.0.1:12340/status")!)
             request.timeoutInterval = 2
@@ -409,7 +585,7 @@ final class BridgeModel: ObservableObject {
             guard !shutDown else { return }
             let status = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             wrapperReady = (response as? HTTPURLResponse)?.statusCode == 200 && (status?["code"] as? Int) == 0
-            connectionDetail = wrapperReady ? "本地下载服务已就绪" : "服务响应异常；点击开始后将重试"
+            connectionDetail = wrapperReady ? "本地下载服务已就绪 · 组件齐全" : "服务响应异常；点击开始后将重试"
         } catch {
             guard !shutDown else { return }
             wrapperReady = false
@@ -421,7 +597,7 @@ final class BridgeModel: ObservableObject {
         guard !importing, !loadingLocalState, !shutDown else { return }
         if busy { stop(); return }
         guard let platform = PlaylistSource.identify(source) else {
-            fail("链接暂不识别", "国内播放器歌单迁移当前可读取 music.163.com；也可粘贴 music.apple.com 公开歌单链接。")
+            fail("链接暂不识别", "可读取网易云、QQ 音乐、酷狗的歌单链接；也可粘贴 music.apple.com 公开歌单链接。")
             return
         }
         busy = true; failed = false; percent = 0; completed = 0; skipped = 0; queue = nil
@@ -431,27 +607,121 @@ final class BridgeModel: ObservableObject {
         let text = link.absoluteString
         pendingPlaylist = nil
         downloadIssue = nil
+        downloadJob = nil
+        neteasePrefetchNotes = [:]
+        jobCurrentIndex = nil
         phase = "正在准备"; taskTitle = "正在读取歌单"; taskDetail = "准备下载，完成后由你决定何时导入"
         workflow = Task { [self] in
             do {
-                var urls = [text]
-                if platform == .netease {
+                var earlySnapshotTaken = false
+                if platform != .apple {
                     let export = try await GoMusicClient().exportPlaylist(url: text)
                     try Task.checkCancellation()
                     guard session == generation else { return }
                     guard let resolvedSelection = export.playlist else { throw PlaylistLibraryError.invalidPlaylist }
                     source = resolvedSelection.sourceURL.absoluteString
                     queue = export.count; phase = "正在匹配"; taskTitle = "正在匹配 Apple Music"
-                    let result = try await AppleMusicCatalogClient().match(export: export) { [weak self] current, total in
-                        guard let self, self.generation == session else { return }
-                        self.taskDetail = "正在匹配 · \(current) / \(total)"
+                    if var resumed = DownloadJobStore(root: root).load(id: resolvedSelection.id), resumed.finishedAt == nil {
+                        // Pick up an interrupted job for this playlist: songs
+                        // already on disk stay downloaded, the rest go back to
+                        // pending (bounded by the attempt cap) and catalog
+                        // matching is not repeated.
+                        var pendingCount = 0
+                        for index in resumed.entries.indices {
+                            switch resumed.entries[index].state {
+                            case .downloading:
+                                resumed.entries[index].state = .pending; pendingCount += 1
+                            case .failed, .timedOut:
+                                if resumed.entries[index].attempts < 3 {
+                                    resumed.entries[index].state = .pending; pendingCount += 1
+                                }
+                            case .pending:
+                                pendingCount += 1
+                            case .downloaded, .skipped:
+                                break
+                            }
+                        }
+                        if pendingCount > 0 {
+                            downloadJob = resumed
+                            pendingPlaylist = export.playlist
+                            pendingPlaylist?.tracks = resumed.entries
+                                .filter { $0.url != nil }
+                                .map { PlaylistSong(title: $0.title, artist: $0.artist, album: $0.album) }
+                            skipped = resumed.entries.filter { $0.state == .skipped }.count
+                            queue = resumed.entries.filter { $0.url != nil }.count
+                            let doneCount = resumed.entries.filter { $0.state == .downloaded }.count
+                            persistJob()
+                            refreshReviewable()
+                            log("恢复未完成的下载任务：已完成 \(doneCount) 首，继续剩余 \(pendingCount) 首。")
+                        }
                     }
-                    try Task.checkCancellation()
-                    guard session == generation else { return }
-                    urls = result.urls; skipped = result.skipped.count
-                    pendingPlaylist = export.playlist
-                    pendingPlaylist?.tracks = result.tracks
-                    if !result.skipped.isEmpty { log("跳过 \(result.skipped.count) 首未确认版本的歌曲。") }
+                    if downloadJob == nil {
+                        let result = try await AppleMusicCatalogClient().match(export: export) { [weak self] current, total in
+                            guard let self, self.generation == session else { return }
+                            self.taskDetail = "正在匹配 · \(current) / \(total)"
+                        }
+                        try Task.checkCancellation()
+                        guard session == generation else { return }
+                        skipped = result.skipped.count
+                        pendingPlaylist = export.playlist
+                        pendingPlaylist?.tracks = result.tracks
+                        if !result.skipped.isEmpty { log("跳过 \(result.skipped.count) 首未确认版本的歌曲。") }
+                        var entries = zip(result.tracks, result.urls).enumerated().map { offset, pair in
+                            // Trace the matched entry back to its source track
+                            // via the query that produced it, so the entry
+                            // keeps the source-platform ID for direct fetch.
+                            let query = offset < result.matchedQueries.count ? result.matchedQueries[offset] : nil
+                            let sourceTrack = query.flatMap { q in
+                                resolvedSelection.tracks.first { $0.title == q.title && $0.artist == q.artist }
+                                    ?? resolvedSelection.tracks.first { $0.title == q.title }
+                            }
+                            return DownloadJobEntry(title: pair.0.title, artist: pair.0.artist, album: pair.0.album, url: pair.1, state: .pending,
+                                                    neteaseID: sourceTrack?.neteaseID, platformID: pair.0.platformID)
+                        }
+                        entries += result.skipped.map { query in
+                            let review = result.reviews.first { $0.query.title == query.title && $0.query.artist == query.artist }
+                            let sourceTrack = resolvedSelection.tracks.first { $0.title == query.title && $0.artist == query.artist }
+                                ?? resolvedSelection.tracks.first { $0.title == query.title }
+                            return DownloadJobEntry(title: query.title, artist: query.artist, state: .skipped,
+                                                    detail: review.map { "未确认版本（\($0.reason)）" } ?? "匹配阶段未确认版本",
+                                                    review: review.map {
+                                                        DownloadJobReview(title: $0.candidateTitle, artist: $0.candidateArtist,
+                                                                          album: $0.candidateAlbum, url: $0.candidateURL,
+                                                                          durationMs: $0.candidateDurationMs, score: $0.score,
+                                                                          reason: $0.reason)
+                                                    },
+                                                    neteaseID: sourceTrack?.neteaseID, platformID: sourceTrack?.platformID)
+                        }
+                        downloadJob = DownloadJob(id: resolvedSelection.id, name: resolvedSelection.name,
+                                                  sourceURL: text, createdAt: Date(), updatedAt: Date(), entries: entries)
+                        queue = result.urls.count
+                        persistJob()
+                        refreshReviewable()
+                        if downloadStrategy == .neteaseFirst {
+                            if platform == .netease, neteaseCookieHeader != nil {
+                                // Snapshot before fetching: wrap-up diffs the
+                                // folder against this baseline, so anything
+                                // fetched now must postdate it to be counted.
+                                let fetchService = importer
+                                let fetchDirectory = root
+                                let earlyScan = Task.detached(priority: .utility) { fetchService.snapshotAudioFiles(in: fetchDirectory) }
+                                let earlyFiles = await withTaskCancellationHandler(operation: { await earlyScan.value }, onCancel: { earlyScan.cancel() })
+                                try Task.checkCancellation()
+                                guard session == generation else { return }
+                                snapshot = earlyFiles
+                                earlySnapshotTaken = true
+                                await prefetchNetease(session: session, selection: resolvedSelection)
+                            } else {
+                                log(platform == .netease ? "网易云优先未生效：尚未登录网易云，本次按 Apple 优先下载。" : "网易云优先仅对网易云歌单生效，本次按 Apple 优先下载。")
+                            }
+                        }
+                    }
+                } else {
+                    downloadJob = DownloadJob(id: "apple-\(UUID().uuidString)", name: "Apple Music 歌单",
+                                              sourceURL: text, createdAt: Date(), updatedAt: Date(),
+                                              entries: [DownloadJobEntry(title: "歌单", artist: "", url: text, state: .pending)])
+                    queue = 1
+                    persistJob()
                 }
                 try Task.checkCancellation()
                 guard session == generation else { return }
@@ -462,19 +732,12 @@ final class BridgeModel: ObservableObject {
                 let files = await withTaskCancellationHandler(operation: { await scan.value }, onCancel: { scan.cancel() })
                 try Task.checkCancellation()
                 guard session == generation else { return }
-                snapshot = files
+                if !earlySnapshotTaken { snapshot = files }
                 phase = "正在连接"; taskTitle = "正在准备下载"
                 taskDetail = "正在检查本地下载服务和登录状态"
                 log("正在准备本地下载服务。")
                 log("音质：\(quality.title)；实际规格以曲目提供的音源为准。")
-                runner.start(binaryPath: root.appendingPathComponent("amdl").path,
-                             workingDirectory: root.path, urls: urls,
-                             wrapperLauncherPath: root.appendingPathComponent("work/wrapper-lite-macos/start-local.sh").path,
-                             wrapperURL: URL(string: "http://127.0.0.1:12340")!, quality: quality,
-                             batchFolder: pendingPlaylist?.name) { [weak self] result in
-                    guard let self, self.generation == session else { return }
-                    if case .failure(let error) = result { self.fail("下载服务未就绪", error.localizedDescription) }
-                }
+                startNextJobSong(session: session)
             } catch {
                 guard !Task.isCancelled, session == generation else { return }
                 fail("下载没有完成", error.localizedDescription)
@@ -484,7 +747,16 @@ final class BridgeModel: ObservableObject {
 
     func stop() {
         guard !importing, !shutDown else { return }
-        generation = UUID(); workflow?.cancel(); progressMonitor?.cancel(); runner.stop()
+        generation = UUID(); workflow?.cancel(); progressMonitor?.cancel(); songWatchdog?.cancel(); runner.stop()
+        if var job = downloadJob, job.finishedAt == nil {
+            for index in job.entries.indices where job.entries[index].state == .downloading {
+                job.entries[index].state = .pending
+            }
+            job.updatedAt = Date()
+            downloadJob = job
+            persistJob()
+        }
+        jobCurrentIndex = nil
         busy = false; phase = "已停止"; taskTitle = "任务已停止"
         taskDetail = "已下载文件保留在电脑中"; log("任务已停止。")
     }
@@ -492,11 +764,15 @@ final class BridgeModel: ObservableObject {
     private func applyDownloadSettings() throws {
         let configURL = root.appendingPathComponent("config.yaml")
         let config = try String(contentsOf: configURL, encoding: .utf8)
-        try DownloadConfiguration.settingCover(originalCover, in: config).write(to: configURL, atomically: true, encoding: .utf8)
+        let withCover = DownloadConfiguration.settingCover(originalCover, in: config)
+        // amdl embeds synced lyrics itself when embed-lrc is on; pin it so a
+        // hand-edited config cannot silently turn lyric embedding off.
+        try DownloadConfiguration.settingEmbedLyrics(true, in: withCover).write(to: configURL, atomically: true, encoding: .utf8)
     }
 
     private func receive(_ line: String) {
         guard busy else { return }
+        lastDownloadActivity = Date()
         // Do not surface raw subprocess output: it may contain account/session values.
         if line.localizedCaseInsensitiveContains("temari library error") {
             downloadIssue = "下载器缺少可用的 Temari 动态库，尚未下载歌曲。"
@@ -536,16 +812,287 @@ final class BridgeModel: ObservableObject {
         }
     }
 
+    /// One amdl process now covers exactly one song, so an exit here ends a
+    /// song, not the job: record the outcome in the ledger, then either
+    /// start the next pending song or, when the queue drains, wrap up.
     private func finished(_ status: Int32) {
         guard busy else { return }
+        songWatchdog?.cancel()
+        guard downloadJob != nil, jobCurrentIndex != nil else { wrapUpDownload(); return }
+        let session = generation
+        let service = importer
+        let directory = root
+        let baseline = jobBaseline
+        let timedOut = songTimedOut
+        workflow = Task {
+            let scan = Task.detached(priority: .utility) { service.changedAudioFiles(in: directory, comparedTo: baseline) }
+            let changed = await withTaskCancellationHandler(operation: { await scan.value }, onCancel: { scan.cancel() })
+            guard !Task.isCancelled, session == generation, !shutDown else { return }
+            if let downloadIssue { fail("下载未确认完成", downloadIssue); return }
+            guard var job = downloadJob, let idx = jobCurrentIndex, job.entries.indices.contains(idx) else { wrapUpDownload(); return }
+            if timedOut {
+                job.entries[idx].state = .timedOut
+                job.entries[idx].detail = "长时间无进展，已自动跳过"
+                log("超时跳过：\(job.entries[idx].title)")
+            } else if status != 0 {
+                job.entries[idx].state = .failed
+                job.entries[idx].detail = "下载器退出代码 \(status)"
+                log("下载失败：\(job.entries[idx].title)（退出代码 \(status)）")
+            } else if changed.isEmpty {
+                job.entries[idx].state = .failed
+                job.entries[idx].detail = "未发现新文件"
+                log("下载失败：\(job.entries[idx].title)（未发现新文件）")
+            } else {
+                job.entries[idx].state = .downloaded
+                job.entries[idx].detail = changed.map { $0.url.lastPathComponent }.joined(separator: "、")
+            }
+            job.updatedAt = Date()
+            downloadJob = job
+            persistJob()
+            jobCurrentIndex = nil
+            startNextJobSong(session: session)
+        }
+    }
+
+    private func startNextJobSong(session: UUID) {
+        guard session == generation, busy else { return }
+        guard var job = downloadJob,
+              let idx = job.entries.firstIndex(where: { $0.state == .pending }),
+              let url = job.entries[idx].url else { wrapUpDownload(); return }
+        job.entries[idx].state = .downloading
+        job.entries[idx].attempts += 1
+        job.updatedAt = Date()
+        downloadJob = job
+        persistJob()
+        jobCurrentIndex = idx
+        songTimedOut = false
+        lastDownloadActivity = Date()
+        let total = job.entries.filter { $0.url != nil }.count
+        let done = job.entries.filter { $0.state == .downloaded }.count
+        phase = "正在下载"
+        taskTitle = job.name
+        let entry = job.entries[idx]
+        taskDetail = "正在下载 · \(done + 1) / \(total)：\(entry.title)" + (entry.artist.isEmpty ? "" : " · \(entry.artist)")
+        let service = importer
+        let directory = root
+        workflow = Task {
+            let scan = Task.detached(priority: .utility) { service.snapshotAudioFiles(in: directory) }
+            let files = await withTaskCancellationHandler(operation: { await scan.value }, onCancel: { scan.cancel() })
+            guard session == generation, busy, !Task.isCancelled else { return }
+            jobBaseline = files
+            runner.start(binaryPath: root.appendingPathComponent("amdl").path,
+                         workingDirectory: root.path, urls: [url],
+                         wrapperLauncherPath: root.appendingPathComponent("work/wrapper-lite-macos/start-local.sh").path,
+                         wrapperURL: URL(string: "http://127.0.0.1:12340")!, quality: quality,
+                         batchFolder: pendingPlaylist?.name) { [weak self] result in
+                guard let self, self.generation == session else { return }
+                if case .failure(let error) = result { self.fail("下载服务未就绪", error.localizedDescription) }
+            }
+            startSongWatchdog(session: session)
+        }
+    }
+
+    /// A song that produces no downloader output for 150 seconds (or runs
+    /// past 15 minutes in total) is treated as stalled: amdl is terminated
+    /// for that song only, the ledger marks it timed out, and the queue
+    /// moves on instead of freezing the whole playlist like before.
+    private func startSongWatchdog(session: UUID) {
+        songWatchdog?.cancel()
+        let started = Date()
+        songWatchdog = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                guard let self, self.generation == session, self.busy, self.jobCurrentIndex != nil else { return }
+                let idle = Date().timeIntervalSince(self.lastDownloadActivity)
+                // The total-runtime cap applies to single-song jobs only: an
+                // Apple playlist arrives as one process for the whole list
+                // and may legitimately run longer.
+                let totalCapExceeded = self.pendingPlaylist != nil && Date().timeIntervalSince(started) > 900
+                if idle > 150 || totalCapExceeded {
+                    self.songTimedOut = true
+                    self.log("单曲下载长时间无进展，已跳过并继续下一首。")
+                    self.runner.terminateCurrentDownload()
+                    return
+                }
+            }
+        }
+    }
+
+    private func persistJob() {
+        guard let job = downloadJob else { return }
+        do { try DownloadJobStore(root: root).save(job) }
+        catch { log("任务记录未保存：\(error.localizedDescription)") }
+    }
+
+    private func refreshReviewable() {
+        guard let job = downloadJob else { reviewableSkips = []; return }
+        reviewableSkips = job.entries.enumerated().compactMap { index, entry in
+            guard entry.state == .skipped, let review = entry.review else { return nil }
+            return ReviewableSkip(id: "\(job.id)#\(index)", jobID: job.id, entryIndex: index,
+                                  title: entry.title, artist: entry.artist,
+                                  candidateTitle: review.title, candidateArtist: review.artist,
+                                  candidateAlbum: review.album, reason: review.reason, score: review.score)
+        }
+    }
+
+    /// Download one song the matcher would not accept automatically, using
+    /// the reviewed candidate the user picked from the review list. The
+    /// entry flips back to pending with the candidate's URL and the usual
+    /// per-song queue takes it from there; wrap-up renumbers it into the
+    /// playlist folder and rebuilds the report with the new state.
+    func downloadReview(_ skip: ReviewableSkip) {
+        guard !busy, !importing, !loadingLocalState, !shutDown else { return }
+        let loaded = (downloadJob?.id == skip.jobID) ? downloadJob : DownloadJobStore(root: root).load(id: skip.jobID)
+        guard var job = loaded,
+              job.entries.indices.contains(skip.entryIndex),
+              let review = job.entries[skip.entryIndex].review else { return }
+        job.entries[skip.entryIndex].url = review.url
+        job.entries[skip.entryIndex].state = .pending
+        job.entries[skip.entryIndex].review = nil
+        job.entries[skip.entryIndex].detail = "人工复核确认下载"
+        job.finishedAt = nil
+        job.updatedAt = Date()
+        downloadJob = job
+        persistJob()
+        refreshReviewable()
+        if let selected = selectedPlaylist, selected.id == job.id { pendingPlaylist = selected }
+        downloadIssue = nil
+        busy = true; failed = false; percent = 0; completed = 0; queue = 1
+        skipped = job.entries.filter { $0.state == .skipped }.count
+        generation = UUID()
+        let session = generation
+        phase = "正在准备"; taskTitle = "正在下载复核歌曲"
+        taskDetail = "\(skip.title)" + (skip.artist.isEmpty ? "" : " · \(skip.artist)")
+        log("按复核确认下载：《\(review.title)》· \(review.artist)")
+        workflow = Task { [self] in
+            do {
+                try applyDownloadSettings()
+                let service = importer
+                let directory = root
+                let scan = Task.detached(priority: .utility) { service.snapshotAudioFiles(in: directory) }
+                let files = await withTaskCancellationHandler(operation: { await scan.value }, onCancel: { scan.cancel() })
+                try Task.checkCancellation()
+                guard session == generation else { return }
+                snapshot = files
+                startNextJobSong(session: session)
+            } catch {
+                guard !Task.isCancelled, session == generation else { return }
+                fail("下载没有完成", error.localizedDescription)
+            }
+        }
+    }
+
+    /// NetEase-first runs: fetch every entry that carries a NetEase ID
+    /// straight from NetEase before the Apple queue starts. Successes flip
+    /// to downloaded with the source tagged, so the per-song queue skips
+    /// them and wrap-up reconciliation treats the files like any other
+    /// download. Failures keep their Apple route; the reason is remembered
+    /// so wrap-up can annotate the ledger (e.g. 需要黑胶 VIP) instead of
+    /// retrying a download that cannot succeed.
+    private func prefetchNetease(session: UUID, selection: PlaylistSelection) async {
+        guard var job = downloadJob,
+              let folderName = DownloaderRunner.sanitizedBatchFolder(selection.name) else { return }
+        let targets = job.entries.indices.filter { job.entries[$0].neteaseID != nil }
+        guard !targets.isEmpty else { return }
+        let folder = root.appendingPathComponent("AM-DL downloads").appendingPathComponent(folderName)
+        let client = FallbackSourceClient(cookieHeader: neteaseCookieHeader)
+        phase = "正在从网易云直下"
+        var fetchedCount = 0
+        for (offset, index) in targets.enumerated() {
+            guard session == generation, !Task.isCancelled, !shutDown else { return }
+            guard let neteaseID = job.entries[index].neteaseID else { continue }
+            taskDetail = "网易云直下 · \(offset + 1) / \(targets.count)：\(job.entries[index].title)"
+            do {
+                let fetched = try await client.fetch(neteaseID: neteaseID, title: job.entries[index].title, artist: job.entries[index].artist, into: folder)
+                job.entries[index].state = .downloaded
+                job.entries[index].source = "netease"
+                job.entries[index].detail = fetched.format == "flac" ? "网易云直下 · 无损 FLAC" : "网易云直下" + (fetched.bitrateKbps.map { " · 约 \($0) kbps" } ?? "")
+                fetchedCount += 1
+            } catch {
+                neteasePrefetchNotes[neteaseID] = await client.unavailabilityNote(neteaseID: neteaseID)
+            }
+        }
+        job.updatedAt = Date()
+        downloadJob = job
+        persistJob()
+        skipped = job.entries.filter { $0.state == .skipped }.count
+        refreshReviewable()
+        log("网易云优先：直下成功 \(fetchedCount) / \(targets.count) 首，其余走 Apple 匹配补缺。")
+    }
+
+    /// Runs once when the per-song queue drains: save the selection, verify
+    /// local matches, renumber, then close out the job ledger with its
+    /// end-of-run report.
+    private func wrapUpDownload() {
+        guard busy else { return }
         progressMonitor?.cancel()
-        if status != 0 { fail("下载没有完成", "下载器退出代码 \(status)，请检查服务和歌单后重试。"); return }
+        songWatchdog?.cancel()
         let session = generation
         let service = importer
         let directory = root
         let previous = snapshot
         phase = "正在核对文件"
         workflow = Task {
+            // Fallback pass: songs the Apple matcher skipped get one attempt
+            // straight from NetEase by their exact track ID before the file
+            // reconciliation below, so anything fetched lands in the same
+            // batch folder and flows through numbering and health checks
+            // like a normal download. The ledger tags the source.
+            if fallbackEnabled, var job = downloadJob, let selection = pendingPlaylist,
+               let folderName = DownloaderRunner.sanitizedBatchFolder(selection.name) {
+                let skippedIndices = job.entries.indices.filter { job.entries[$0].state == .skipped && job.entries[$0].neteaseID != nil }
+                if !skippedIndices.isEmpty {
+                    phase = "正在尝试备用源"
+                    let folder = directory.appendingPathComponent("AM-DL downloads").appendingPathComponent(folderName)
+                    let client = FallbackSourceClient(cookieHeader: self.neteaseCookieHeader)
+                    var fetchedCount = 0
+                    var annotatedCount = 0
+                    for index in skippedIndices {
+                        guard !Task.isCancelled, session == generation, !shutDown else { return }
+                        let entry = job.entries[index]
+                        guard let neteaseID = entry.neteaseID else { continue }
+                        // A NetEase-first run already learned why this track
+                        // cannot be fetched; record that in the ledger
+                        // instead of asking again.
+                        if let note = neteasePrefetchNotes[neteaseID] {
+                            job.entries[index].detail = note
+                            annotatedCount += 1
+                            continue
+                        }
+                        do {
+                            let fetched = try await client.fetch(neteaseID: neteaseID, title: entry.title, artist: entry.artist, into: folder)
+                            job.entries[index].state = .downloaded
+                            job.entries[index].source = "netease"
+                            job.entries[index].detail = fetched.format == "flac" ? "网易云直下 · 无损 FLAC" : "网易云直下" + (fetched.bitrateKbps.map { " · 约 \($0) kbps" } ?? "")
+                            fetchedCount += 1
+                            log("备用源补下：《\(entry.title)》· \(entry.artist)（网易云直下，来源已记录）")
+                        } catch {
+                            // The ledger, not just the log, must say why the
+                            // song is missing — above all when the honest
+                            // answer is "needs 黑胶 VIP".
+                            if let fallbackError = error as? FallbackSourceClient.FallbackError {
+                                switch fallbackError {
+                                case .noStream:
+                                    job.entries[index].detail = await client.unavailabilityNote(neteaseID: neteaseID)
+                                case .emptyDownload:
+                                    job.entries[index].detail = "网易云返回的文件不完整"
+                                }
+                            } else {
+                                job.entries[index].detail = "网易云下载失败：\(error.localizedDescription)"
+                            }
+                            annotatedCount += 1
+                            log("备用源未下到：《\(entry.title)》· \(entry.artist)：\(error.localizedDescription)")
+                        }
+                    }
+                    if fetchedCount > 0 || annotatedCount > 0 {
+                        job.updatedAt = Date()
+                        downloadJob = job
+                        persistJob()
+                        refreshReviewable()
+                    }
+                    phase = "正在核对文件"
+                }
+            }
             let scan = Task.detached(priority: .utility) { service.changedAudioFiles(in: directory, comparedTo: previous) }
             let changed = await withTaskCancellationHandler(operation: { await scan.value }, onCancel: { scan.cancel() })
             guard !Task.isCancelled, session == generation, !shutDown else { return }
@@ -584,13 +1131,242 @@ final class BridgeModel: ObservableObject {
                 fail("下载未确认完成", downloadIssue)
                 return
             }
+            if let selection = pendingPlaylist {
+                let renumbered = await Task.detached(priority: .utility) {
+                    PlaylistLibrary(root: directory).renumberBatchFolder(for: selection)
+                }.value
+                guard !Task.isCancelled, session == generation, !shutDown else { return }
+                if renumbered.renamed > 0 {
+                    log("已按歌单顺序整理下载编号：\(renumbered.renamed) 首。")
+                }
+                let playlistCount = await Task.detached(priority: .utility) {
+                    PlaylistLibrary(root: directory).writeM3U(for: selection)
+                }.value
+                guard !Task.isCancelled, session == generation, !shutDown else { return }
+                if playlistCount > 0 {
+                    log("已生成通用播放列表（.m3u8）：\(playlistCount) 首，其他播放器打开歌单文件夹即可使用。")
+                }
+            }
+            let rateCap = quality.maximumSampleRate
+            let healthWarnings = await Task.detached(priority: .utility) { () -> [String] in
+                var warnings: [String] = []
+                let checker = IPodImporter()
+                for item in changed {
+                    let result = checker.healthCheck(item.url)
+                    if !result.playable {
+                        warnings.append("文件不可播：\(item.url.lastPathComponent)")
+                    } else if let rate = result.sampleRate, rate > rateCap {
+                        warnings.append("采样率 \(rate) Hz 超过当前音质上限：\(item.url.lastPathComponent)")
+                    }
+                }
+                return warnings
+            }.value
+            guard !Task.isCancelled, session == generation, !shutDown else { return }
+            for warning in healthWarnings { log("体检：\(warning)") }
             busy = false
             completed = changed.count; percent = 100
             phase = missing > 0 ? "下载结束 · 有未匹配歌曲" : "下载完成"
             taskTitle = "新增或更新 \(changed.count) 首" + (localCount.map { " · 本地匹配 \($0) 首" } ?? "")
             taskDetail = missing > 0 ? "仍有 \(missing) 首未匹配或未下载；不会生成完整歌单" : "本地检查完成；不会自动导入设备"
             log("下载器结束；新增或更新 \(changed.count) 个音频文件，\(missing) 首未匹配或未下载。")
+            if var job = downloadJob {
+                job.finishedAt = Date()
+                job.updatedAt = Date()
+                let names = { (state: DownloadJobEntryState) -> [String] in
+                    job.entries.filter { $0.state == state }.map { $0.artist.isEmpty ? $0.title : "\($0.title) · \($0.artist)" }
+                }
+                let fallbackNames = job.entries.filter { $0.state == .downloaded && $0.source == "netease" }
+                    .map { $0.artist.isEmpty ? $0.title : "\($0.title) · \($0.artist)" }
+                let report = DownloadJobReport(generatedAt: Date(), downloaded: names(.downloaded),
+                                               skipped: names(.skipped), failed: names(.failed), timedOut: names(.timedOut),
+                                               warnings: healthWarnings, fallbackDownloads: fallbackNames)
+                job.report = report
+                downloadJob = job
+                persistJob()
+                refreshReviewable()
+                let skippedLines = job.entries.filter { $0.state == .skipped }.map { entry -> String in
+                    let base = entry.artist.isEmpty ? entry.title : "\(entry.title) · \(entry.artist)"
+                    if let review = entry.review { return base + "（最接近候选：《\(review.title)》· \(review.artist)，\(review.reason)）" }
+                    return base
+                }
+                if !skippedLines.isEmpty { log("跳过 \(skippedLines.count) 首：\(skippedLines.joined(separator: "；"))") }
+                if !report.failed.isEmpty { log("失败 \(report.failed.count) 首：\(report.failed.joined(separator: "；"))") }
+                if !report.timedOut.isEmpty { log("超时跳过 \(report.timedOut.count) 首：\(report.timedOut.joined(separator: "；"))") }
+                if !report.fallbackDownloads.isEmpty { log("其中备用源（网易云）补下 \(report.fallbackDownloads.count) 首：\(report.fallbackDownloads.joined(separator: "；"))") }
+            }
             refreshDevice()
+        }
+    }
+
+    /// Export the current playlist's local files to a folder the user
+    /// picks, with an .m3u8 beside them: the one general-purpose preset,
+    /// original files copied as-is under the playlist's name.
+    func exportCurrentPlaylist() {
+        guard !busy, !importing, !loadingLocalState, !shutDown else { return }
+        guard let selection = selectedPlaylist else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "导出到这里"
+        panel.message = "把《\(selection.name)》的本地歌曲导出到所选文件夹"
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        let directory = root
+        Task {
+            let result = await Task.detached(priority: .utility) { () -> String in
+                do {
+                    let library = PlaylistLibrary(root: directory)
+                    let found = try library.nativeFiles(for: selection)
+                    let folderName = PlaylistLibrary.deviceFolderName(selection)
+                    let folder = destination.appendingPathComponent(folderName)
+                    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                    var copied: [URL] = []
+                    for item in found.files {
+                        let target = folder.appendingPathComponent(item.url.lastPathComponent)
+                        if !FileManager.default.fileExists(atPath: target.path) {
+                            try FileManager.default.copyItem(at: item.url, to: target)
+                        }
+                        copied.append(target)
+                    }
+                    let ordered = PlaylistLibrary.orderedAudioFiles(copied)
+                    let content = PlaylistLibrary.m3uContent(name: selection.name, files: ordered, tracks: selection.tracks)
+                    try content.write(to: folder.appendingPathComponent(folderName + ".m3u8"), atomically: true, encoding: .utf8)
+                    return "已导出 \(ordered.count) 首到 \(folder.path)，含 .m3u8 播放列表。"
+                } catch {
+                    return "导出失败：\(error.localizedDescription)"
+                }
+            }.value
+            guard !shutDown else { return }
+            log(result)
+        }
+    }
+
+    /// Stage 5c: decode .ncm files the user already downloaded with
+    /// the official NetEase client. Decoding is purely local; results
+    /// land in the "NCM 导入" folder, and in Rockbox mode they go
+    /// straight into the standard import preview from there.
+    func importNCM() {
+        guard !busy, !importing, !loadingLocalState, !shutDown else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "解码"
+        panel.message = "选择官方客户端下载的 .ncm 文件或所在文件夹"
+        guard panel.runModal() == .OK else { return }
+        var sources: [URL] = []
+        for url in panel.urls {
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue {
+                if let walker = FileManager.default.enumerator(at: url, includingPropertiesForKeys: nil) {
+                    for case let file as URL in walker where file.pathExtension.lowercased() == "ncm" {
+                        sources.append(file)
+                    }
+                }
+            } else if url.pathExtension.lowercased() == "ncm" {
+                sources.append(url)
+            }
+        }
+        guard !sources.isEmpty else {
+            fail("没有找到 .ncm 文件", "所选位置里没有扩展名为 .ncm 的文件。")
+            return
+        }
+        busy = true
+        phase = "解码 .ncm"
+        taskTitle = "正在解码 \(sources.count) 个 .ncm 文件"
+        taskDetail = "本地解码，不联网、不需要账号"
+        let directory = root
+        let session = generation
+        workflow = Task {
+            let outcome = await Task.detached(priority: .userInitiated) { () -> (folder: URL, ok: [String], failed: [String]) in
+                let folder = directory.appendingPathComponent("NCM 导入")
+                try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                var ok: [String] = []
+                var failed: [String] = []
+                var usedNames = Set<String>()
+                for source in sources {
+                    do {
+                        let song = try NcmDecoder.decode([UInt8](try Data(contentsOf: source)))
+                        let stem = Self.ncmFileStem(song: song, fallback: source.deletingPathExtension().lastPathComponent)
+                        var candidate = stem
+                        var suffix = 2
+                        while usedNames.contains(candidate.lowercased())
+                                || FileManager.default.fileExists(atPath: folder.appendingPathComponent(candidate + "." + song.format).path) {
+                            candidate = "\(stem) (\(suffix))"
+                            suffix += 1
+                        }
+                        usedNames.insert(candidate.lowercased())
+                        try NcmTagWriter.tagged(song).write(to: folder.appendingPathComponent(candidate + "." + song.format))
+                        if let cover = song.cover, !cover.isEmpty {
+                            let coverURL = folder.appendingPathComponent(candidate + (song.coverMIME == "image/png" ? ".png" : ".jpg"))
+                            try? cover.write(to: coverURL)
+                        }
+                        ok.append(candidate)
+                    } catch {
+                        failed.append("\(source.lastPathComponent)：\(error.localizedDescription)")
+                    }
+                }
+                return (folder, ok, failed)
+            }.value
+            guard !shutDown, generation == session else { return }
+            busy = false
+            for line in outcome.failed { log("ncm 解码失败 · \(line)") }
+            guard !outcome.ok.isEmpty else {
+                fail("解码未成功", "没有文件被解开，具体原因已记入运行日志。")
+                return
+            }
+            phase = "解码完成"
+            taskTitle = "已解码 \(outcome.ok.count) 首到「NCM 导入」"
+            taskDetail = outcome.failed.isEmpty ? "文件在项目目录的「NCM 导入」文件夹中" : "另有 \(outcome.failed.count) 首失败，见运行日志"
+            log("ncm 解码完成：\(outcome.ok.count) 首 → \(outcome.folder.path)")
+            if resolvedImportMode == .rockbox, device != nil {
+                previewDecodedFolder(outcome.folder)
+            }
+        }
+    }
+
+    private nonisolated static func ncmFileStem(song: NcmDecoder.Song, fallback: String) -> String {
+        let base: String
+        if !song.title.isEmpty {
+            base = song.artist.isEmpty ? song.title : "\(song.artist) - \(song.title)"
+        } else {
+            base = fallback
+        }
+        let invalid = CharacterSet(charactersIn: "/:\\?%*|\"<>")
+        let cleaned = base.components(separatedBy: invalid).joined(separator: " ").trimmingCharacters(in: .whitespaces)
+        return cleaned.isEmpty ? "未命名" : cleaned
+    }
+
+    /// The Rockbox half of importMusic(), pointed at an arbitrary
+    /// folder instead of the download root: validate, preview, and let
+    /// the shared confirm step do the writing.
+    private func previewDecodedFolder(_ folder: URL) {
+        refreshDevice()
+        guard let target = device, target.canImport else { return }
+        importing = true; failed = false; percent = 0; queue = nil; completed = 0; skipped = 0
+        phase = "1/4 · 扫描歌曲"; taskTitle = "正在统计解码歌曲"
+        taskDetail = "先检查歌曲与目标，预览后再开始导入"
+        let session = generation
+        workflow = Task {
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    let service = IPodImporter()
+                    try service.validateFilesystem(on: target)
+                    return try service.preview(service.audioFiles(in: folder), device: target,
+                                               playlistName: "NCM 导入", playlistID: nil, missing: 0)
+                }.value
+                guard !shutDown, generation == session else { return }
+                importing = false
+                phase = "等待确认"; taskTitle = "Rockbox 导入预览已就绪"
+                taskDetail = "确认后才写入设备"
+                rockboxPreview = result
+                NotificationCenter.default.post(name: .mbGoImport, object: nil)
+            } catch {
+                guard !shutDown, generation == session else { return }
+                importing = false
+                if IPodImporter.isDeviceIOError(error) { deviceIOFailure = true }
+                fail("导入预览未完成", error.localizedDescription)
+            }
         }
     }
 
@@ -637,6 +1413,7 @@ final class BridgeModel: ObservableObject {
         let session = generation
         let directory = root
         let playlist = selectedPlaylist
+        let coverMaxPixel = ipodCover256 ? 256 : 600
         workflow = Task {
           do {
             do {
@@ -655,7 +1432,7 @@ final class BridgeModel: ObservableObject {
                 let service = IPodImporter()
                 var prepared: PreparedPlaylist?
                 if let playlist {
-                    prepared = try PlaylistLibrary(root: directory).prepare(playlist, coverData: Data()) { current, total, detail in
+                    prepared = try PlaylistLibrary(root: directory).prepare(playlist, coverData: Data(), coverMaxPixel: coverMaxPixel) { current, total, detail in
                         DispatchQueue.main.async { [self] in
                             guard self.importing, !self.shutDown, self.generation == session else { return }
                             self.phase = "1/4 · 准备歌单"

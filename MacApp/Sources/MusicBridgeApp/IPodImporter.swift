@@ -60,6 +60,8 @@ struct MediaCheckResult: Sendable {
     let hasEmbeddedCover: Bool
     let codec: String?
     var container: String? = nil
+    var durationSeconds: Double? = nil
+    var sampleRate: Int? = nil
 }
 
 struct IPodImportReport: Sendable {
@@ -776,6 +778,10 @@ struct IPodImporter: Sendable {
         }
     }
 
+    /// Post-download health check for one file, reusing the same ffprobe
+    /// inspection as the import path: playable, codec, sample rate, duration.
+    func healthCheck(_ url: URL) -> MediaCheckResult { inspect(url) }
+
     private func inspect(_ url: URL) -> MediaCheckResult {
         guard let ffprobe = findFFProbe() else {
             return MediaCheckResult(playable: false, bitrate: nil, hasEmbeddedCover: false, codec: nil)
@@ -784,7 +790,7 @@ struct IPodImporter: Sendable {
         process.executableURL = URL(fileURLWithPath: ffprobe)
         process.arguments = [
             "-v", "error",
-            "-show_entries", "stream=codec_type,codec_name,disposition:format=bit_rate,format_name",
+            "-show_entries", "stream=codec_type,codec_name,sample_rate,disposition:format=bit_rate,format_name,duration",
             "-of", "json",
             url.path
         ]
@@ -812,7 +818,9 @@ struct IPodImporter: Sendable {
                 bitrate: bitrate,
                 hasEmbeddedCover: hasCover,
                 codec: audio?.codecName,
-                container: output.format?.formatName
+                container: output.format?.formatName,
+                durationSeconds: Double(output.format?.duration ?? ""),
+                sampleRate: audio?.sampleRate.flatMap(Int.init)
             )
         } catch {
             return MediaCheckResult(playable: false, bitrate: nil, hasEmbeddedCover: false, codec: nil)
@@ -909,12 +917,14 @@ private struct ProbeStream: Decodable {
     let codecType: String?
     let codecName: String?
     let bitRate: String?
+    let sampleRate: String?
     let disposition: ProbeDisposition?
 
     enum CodingKeys: String, CodingKey {
         case codecType = "codec_type"
         case codecName = "codec_name"
         case bitRate = "bit_rate"
+        case sampleRate = "sample_rate"
         case disposition
     }
 }
@@ -930,9 +940,11 @@ private struct ProbeDisposition: Decodable {
 private struct ProbeFormat: Decodable {
     let bitRate: String?
     let formatName: String?
+    let duration: String?
 
     enum CodingKeys: String, CodingKey {
         case bitRate = "bit_rate"
         case formatName = "format_name"
+        case duration
     }
 }
