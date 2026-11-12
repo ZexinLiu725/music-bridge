@@ -8,7 +8,7 @@ English · [简体中文](README.zh-CN.md)
 
 > Source beta. The app interface is currently in Simplified Chinese. Live playlist downloads and imports to a physical iPod have not yet completed end-to-end validation.
 
-![Music Bridge main window with native macOS window controls and no iPod connected](docs/screenshots/music-bridge-main.jpg)
+![Music Bridge main window with native macOS window controls and no iPod connected](docs/screenshots/music-bridge-main-v10.jpg)
 
 *Captured from the running app on Apple Silicon with macOS 27.2. This is the idle state with no device connected.*
 
