@@ -12,6 +12,12 @@ English · [简体中文](README.zh-CN.md)
 
 *Captured from the running app on Apple Silicon with macOS 27.2. This is the idle state with no device connected.*
 
+![Music Bridge promo: cover](docs/screenshots/music-bridge-promo-1-cover.jpg)
+
+![Music Bridge promo: native macOS interface](docs/screenshots/music-bridge-promo-2-ui.jpg)
+
+![Music Bridge promo: three steps, playlists into your iPod](docs/screenshots/music-bridge-promo-3-flow.jpg)
+
 ## Features
 
 - **Chinese-player playlist migration:** currently reads public music.163.com playlists and matches them to the Apple Music China catalog, or accepts Apple Music public playlists directly. Uncertain versions are skipped.

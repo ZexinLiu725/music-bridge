@@ -12,6 +12,34 @@
 
 *在 Apple Silicon、macOS 27.2 上从实际运行的应用采集。画面为未连接设备、没有活动任务的状态。*
 
+## Apple 母带，一步到 iPod
+
+![Music Bridge 宣传图：封面](docs/screenshots/music-bridge-promo-1-cover.jpg)
+
+![Music Bridge 宣传图：原生 macOS 界面](docs/screenshots/music-bridge-promo-2-ui.jpg)
+
+![Music Bridge 宣传图：三步，歌单进 iPod](docs/screenshots/music-bridge-promo-3-flow.jpg)
+
+**它是什么**
+
+Music Bridge 是一款 macOS 应用，专门把流媒体上的歌单，送进 iPod Classic。
+
+**音源**
+
+歌单来自网易云、QQ 音乐、酷狗，音源走 Apple Music 母带无损。下载的是 ALAC，采样率封顶 48 kHz，正好是 iPod Classic 能完整解码的上限——下回来不用再转码，音质也不打折。
+
+**流程**
+
+粘贴歌单链接，剩下的三步：解析、下载、导入。歌单顺序、编号、同名封面都处理好，Rockbox 和原生系统都能导入。
+
+**解码**
+
+电脑里已经有的 .ncm 文件，可以直接在本地解码，标签和封面一起还原，照样导入 iPod。
+
+**本地运行**
+
+全程在你自己的 Mac 上完成，登录用你自己的账号，文件不经过第三方服务器。支持 macOS 14 及以上系统。
+
 ## 功能
 
 - **国内播放器歌单迁移**：当前读取 `music.163.com` 公开歌单，并匹配到 Apple Music 中国区目录；也可直接使用 Apple Music 公开歌单链接。无法确认的版本会跳过。
