@@ -3,8 +3,11 @@ set -euo pipefail
 BRIDGE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODE="${1:-run}"
 APP="$BRIDGE_ROOT/dist/MusicBridgeApp.app"
-swift build --package-path "$BRIDGE_ROOT/MacApp"
-BIN="$(swift build --package-path "$BRIDGE_ROOT/MacApp" --show-bin-path)/MusicBridgeApp"
+# SwiftBuild (the default build system) fails to initialize on this machine
+# with "Unknown error parsing property list" before generating any file, so
+# builds pin the native build system until that toolchain issue is resolved.
+swift build --build-system native --package-path "$BRIDGE_ROOT/MacApp"
+BIN="$(swift build --build-system native --package-path "$BRIDGE_ROOT/MacApp" --show-bin-path)/MusicBridgeApp"
 # Stop only this checkout's build, leaving the Muse installation untouched.
 while IFS= read -r pid; do
   if [[ -n "$pid" ]]; then kill "$pid"; fi
@@ -26,8 +29,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
+<key>NSDocumentsFolderUsageDescription</key><string>读取本项目中的歌单记录、下载音乐和导入任务，用于本地音乐管理。</string>
+<key>NSRemovableVolumesUsageDescription</key><string>读取连接的 iPod 曲库；仅在确认导入或初始化后写入歌曲及数据库。</string>
 </dict></plist>
 PLIST
+# Bind the rebuilt executable and usage descriptions to the app's stable identity.
+/usr/bin/codesign --force --sign - --identifier cn.unmeta.musicbridge.rebuilt "$APP"
 case "$MODE" in
   --build-only) ;;
   run) /usr/bin/open -n "$APP" ;;

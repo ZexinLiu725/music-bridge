@@ -30,6 +30,16 @@ enum DownloadConfiguration {
         }
         return configuration + (configuration.hasSuffix("\n") ? "" : "\n") + replacement + "\n"
     }
+
+    static func settingEmbedLyrics(_ enabled: Bool, in configuration: String) -> String {
+        let replacement = "embed-lrc: \(enabled ? "true" : "false")"
+        if let range = configuration.range(of: "(?m)^embed-lrc:[^\\n]*", options: .regularExpression) {
+            var result = configuration
+            result.replaceSubrange(range, with: replacement)
+            return result
+        }
+        return configuration + (configuration.hasSuffix("\n") ? "" : "\n") + replacement + "\n"
+    }
 }
 
 enum AudioQuality: String, CaseIterable, Identifiable {
@@ -47,6 +57,7 @@ enum AudioQuality: String, CaseIterable, Identifiable {
 struct PlaylistExport: Sendable {
     let text: String
     let count: Int
+    var playlist: PlaylistSelection? = nil
 }
 
 enum WorkflowStep: Int, CaseIterable, Identifiable, Hashable {
@@ -58,7 +69,7 @@ enum WorkflowStep: Int, CaseIterable, Identifiable, Hashable {
 
     var title: String {
         switch self {
-        case .source: return "导出网易云歌单"
+        case .source: return "读取国内播放器歌单"
         case .migrate: return "迁移到 Apple Music"
         case .download: return "下载 Apple Music 歌单"
         }

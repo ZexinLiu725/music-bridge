@@ -29,6 +29,7 @@ final class DownloaderRunner: NSObject {
                wrapperLauncherPath: String?,
                wrapperURL: URL,
                quality: AudioQuality,
+               batchFolder: String? = nil,
                completion: @escaping (Result<Void, Error>) -> Void) {
         stopDownloader()
         generation = UUID()
@@ -51,6 +52,7 @@ final class DownloaderRunner: NSObject {
                                   urls: urls,
                                   wrapperURL: wrapperURL,
                                   quality: quality,
+                                  batchFolder: batchFolder,
                                   completion: completion)
         }
 
@@ -67,6 +69,7 @@ final class DownloaderRunner: NSObject {
                                   urls: [String],
                                   wrapperURL: URL,
                                   quality: AudioQuality,
+                                  batchFolder: String?,
                                   completion: @escaping (Result<Void, Error>) -> Void) {
         let process = Process()
         process.executableURL = binaryURL
@@ -77,7 +80,7 @@ final class DownloaderRunner: NSObject {
         // current binary already returns a non-zero exit status on failure;
         // older builds accepted --exit-on-error, but current amdl rejects it
         // before it can inspect the playlist URL.
-        process.arguments = Self.arguments(urls: urls, wrapperURL: wrapperURL, quality: quality)
+        process.arguments = Self.arguments(urls: urls, wrapperURL: wrapperURL, quality: quality, batchFolder: batchFolder)
 
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -109,8 +112,29 @@ final class DownloaderRunner: NSObject {
         }
     }
 
-    static func arguments(urls: [String], wrapperURL: URL, quality: AudioQuality) -> [String] {
-        ["--lite-server", wrapperURL.absoluteString, "--alac-max", String(quality.maximumSampleRate), "--json"] + urls
+    static func arguments(urls: [String], wrapperURL: URL, quality: AudioQuality, batchFolder: String? = nil) -> [String] {
+        var arguments = ["--lite-server", wrapperURL.absoluteString, "--alac-max", String(quality.maximumSampleRate), "--json"]
+        // When a playlist was resolved into individual songs (e.g. a NetEase
+        // playlist), amdl would otherwise file each song under its own
+        // artist/album folders. --save-subfolder makes the batch land flat in
+        // one folder named after the playlist instead. Requires an amdl build
+        // that knows the flag.
+        if let folder = sanitizedBatchFolder(batchFolder) {
+            arguments += ["--save-subfolder", folder]
+        }
+        return arguments + urls
+    }
+
+    /// Make a playlist name safe to use as a single folder name, including on
+    /// FAT32 volumes: path separators and other illegal characters become
+    /// underscores, and trailing dots/spaces are dropped.
+    static func sanitizedBatchFolder(_ name: String?) -> String? {
+        guard var folder = name?.trimmingCharacters(in: .whitespacesAndNewlines), !folder.isEmpty else { return nil }
+        let forbidden = CharacterSet(charactersIn: "/\\<>:\"|?*").union(.controlCharacters)
+        folder = folder.components(separatedBy: forbidden).joined(separator: "_")
+        folder = folder.trimmingCharacters(in: .whitespacesAndNewlines)
+        while folder.hasSuffix(".") { folder = String(folder.dropLast()) }
+        return folder.isEmpty ? nil : folder
     }
 
     private func waitForWrapper(orStartAt launcherPath: String?,
@@ -286,6 +310,14 @@ final class DownloaderRunner: NSObject {
     private func stopDownloader() {
         process?.terminate()
         process = nil
+    }
+
+    /// Terminate only the current amdl process while still delivering
+    /// onFinished, unlike stopDownloader(), which suppresses the callback
+    /// for an intentional stop. The per-song watchdog uses this when one
+    /// song stalls, so the queue can mark it timed out and move on.
+    func terminateCurrentDownload() {
+        process?.terminate()
     }
 
     /// Stop both children, used when the user explicitly presses Stop.

@@ -8,5 +8,13 @@ swiftc -parse-as-library -swift-version 5 \
   "$SOURCES/Models.swift" "$SOURCES/BridgeModel.swift" "$SOURCES/SurfaceMotion.swift" \
   "$SOURCES/GoMusicClient.swift" "$SOURCES/AppleMusicCatalogClient.swift" \
   "$SOURCES/DownloaderRunner.swift" "$SOURCES/IPodImporter.swift" \
-  "$BRIDGE_ROOT/MacApp/Tests/MusicBridgeChecks.swift" -o "$CHECK_DIR/check"
+  "$SOURCES/PlaylistLibrary.swift" \
+  "$SOURCES/NativeIPodImporter.swift" \
+  "$SOURCES/NativeLibraryService.swift" "$SOURCES/NativeImportTask.swift" \
+  "$SOURCES/IPodKnowledge.swift" "$SOURCES/NativeAudioPlanner.swift" "$SOURCES/NativeImportViews.swift" \
+  "$BRIDGE_ROOT/MacApp/Tests/MusicBridgeChecks.swift" \
+  "$BRIDGE_ROOT/MacApp/Tests/NativeEngineChecks.swift" \
+  "$BRIDGE_ROOT/MacApp/Tests/NativeWorkflowChecks.swift" \
+  "$BRIDGE_ROOT/MacApp/Tests/DeviceDiscoveryChecks.swift" \
+  "$BRIDGE_ROOT/MacApp/Tests/IPodKnowledgeChecks.swift" -o "$CHECK_DIR/check"
 "$CHECK_DIR/check"
