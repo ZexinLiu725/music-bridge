@@ -3,7 +3,7 @@ import Foundation
 struct GoMusicClient {
     func exportPlaylist(url: String) async throws -> PlaylistExport {
         // Retain ordered membership, name and artwork for device import.
-        // Recognition covers NetEase, QQ Music and Kugou playlists; the
+        // Recognition covers NetEase, QQ Music and Kugou playlists and NetEase singles; the
         // parsers all produce the same PlaylistSelection, so the rest of
         // the pipeline never cares which platform a link came from.
         let playlist: PlaylistSelection

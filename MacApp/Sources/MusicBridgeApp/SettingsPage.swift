@@ -30,6 +30,7 @@ struct SettingsPage: View {
             if model.neteaseQRImage != nil {
                 qrCard
             }
+            appleAccountCard
             accountCard
             disclosures
             logCard
@@ -74,6 +75,29 @@ struct SettingsPage: View {
             Spacer(minLength: 0)
         }
         .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .floatingSurface()
+    }
+
+    /// Apple sign-in happens in a terminal (the wrapper's own login
+    /// script), so this card is the guided path into it: the current
+    /// state, a button that opens the login terminal, and an honest
+    /// note that credentials never touch the app.
+    private var appleAccountCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Apple 账号").font(.system(size: 15, weight: .semibold))
+            HStack {
+                Text(model.wrapperReady ? "下载服务已就绪" : model.connectionDetail)
+                    .foregroundStyle(model.wrapperReady ? Paint.green : Paint.secondary)
+                Spacer()
+                Button("检查状态") { Task { await model.checkService() } }
+                    .disabled(model.checkingService)
+                Button("登录 Apple 账号") { model.openAppleLogin() }
+            }
+            Text("下载 Apple Music 要先用 Apple 账号登录一次。点登录会打开终端，账号、密码和验证码只在终端里输给 Apple，Music Bridge 不保存；登录完成回到这里，状态会自动变绿。")
+                .font(.system(size: 12)).foregroundStyle(Paint.secondary).lineSpacing(3)
+        }
+        .padding(23)
         .frame(maxWidth: .infinity, alignment: .leading)
         .floatingSurface()
     }

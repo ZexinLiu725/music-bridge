@@ -44,6 +44,12 @@ struct PlaylistSelection: Codable, Sendable, Equatable {
             let data = try await request(URL(string: "https://music.163.com/api/v1/album/\(id)")!)
             return try parseAlbum(data, id: id)
         }
+        if path.contains("song") {
+            var detail = URLComponents(string: "https://music.163.com/api/song/detail")!
+            detail.queryItems = [URLQueryItem(name: "ids", value: "[\(id)]")]
+            let data = try await request(detail.url!)
+            return try parseSong(data, id: id)
+        }
         guard path.contains("playlist") else { throw PlaylistLibraryError.invalidPlaylist }
         let data = try await request(URL(string: "https://music.163.com/api/v6/playlist/detail?id=\(id)&n=10000&s=0")!)
         guard let envelope = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -103,6 +109,34 @@ struct PlaylistSelection: Codable, Sendable, Equatable {
         guard songs.count == count else { throw PlaylistLibraryError.incompletePlaylist }
         return PlaylistSelection(id: id, name: name, sourceURL: URL(string: "https://music.163.com/album?id=\(id)")!,
                                  coverURL: cover, tracks: songs, sourceTrackCount: count)
+    }
+
+    /// A single-song link becomes a one-track selection, so the rest of
+    /// the pipeline (catalog matching, download, import) treats it like
+    /// any other list. The song's album is deliberately left unset on
+    /// the track, matching the playlist path: catalog matching must not
+    /// veto a candidate over an album-name spelling difference. The
+    /// album's artwork still becomes the selection cover.
+    static func parseSong(_ data: Data, id: String) throws -> PlaylistSelection {
+        guard !id.isEmpty, id.allSatisfy(\.isNumber),
+              let envelope = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              envelope["code"] as? Int == 200,
+              let tracks = envelope["songs"] as? [[String: Any]], tracks.count == 1,
+              let track = tracks.first,
+              (track["id"] as? NSNumber)?.stringValue == id,
+              let title = track["name"] as? String, !title.isEmpty,
+              let artists = (track["ar"] as? [[String: Any]]) ?? (track["artists"] as? [[String: Any]]),
+              let albumInfo = track["al"] as? [String: Any],
+              let coverString = albumInfo["picUrl"] as? String,
+              let cover = URL(string: coverString.replacingOccurrences(of: "http://", with: "https://")) else {
+            throw PlaylistLibraryError.incompletePlaylist
+        }
+        let artist = artists.compactMap { $0["name"] as? String }.joined(separator: " & ")
+        guard !artist.isEmpty else { throw PlaylistLibraryError.incompletePlaylist }
+        let song = PlaylistSong(title: title, artist: artist,
+                                neteaseID: id, durationMs: (track["dt"] as? NSNumber)?.intValue)
+        return PlaylistSelection(id: id, name: title, sourceURL: URL(string: "https://music.163.com/song?id=\(id)")!,
+                                 coverURL: cover, tracks: [song], sourceTrackCount: 1)
     }
 
     private static func request(_ url: URL) async throws -> Data {

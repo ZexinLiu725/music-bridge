@@ -171,6 +171,9 @@ struct BridgeView: View {
         VStack(spacing: 20) {
             pageHeader("下载", "粘贴歌单链接，剩下的交给它。")
             journeySteps
+            if !model.wrapperReady && !model.appleServiceSeenReady {
+                appleLoginBanner
+            }
             sourceCard
             progressCard
             if !model.reviewableSkips.isEmpty {
@@ -222,6 +225,27 @@ struct BridgeView: View {
         } else {
             content
         }
+    }
+
+    /// First-run guidance for the one step that happens outside the
+    /// app: until an Apple account has been signed in once, downloads
+    /// cannot start, so the download page says so up front — with the
+    /// way in — instead of letting the first download fail.
+    private var appleLoginBanner: some View {
+        HStack(spacing: 14) {
+            Image(systemName: "person.crop.circle.badge.exclamationmark")
+                .font(.system(size: 20)).foregroundStyle(Paint.blue)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("先登录一次 Apple 账号").font(.system(size: 13, weight: .semibold))
+                Text("下载 Apple Music 前要完成一次登录：在打开的终端里输账号和密码，App 不保存。登过一次之后就不用再管。")
+                    .font(.system(size: 12)).foregroundStyle(Paint.secondary)
+            }
+            Spacer(minLength: 0)
+            Button("登录 Apple 账号") { model.openAppleLogin() }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .floatingSurface()
     }
 
     private var importPage: some View {
