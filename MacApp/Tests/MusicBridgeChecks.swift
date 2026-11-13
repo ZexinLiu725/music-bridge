@@ -9,12 +9,22 @@ struct BridgeChecks {
         precondition(PlaylistSource.identify("https://music.163.com/playlist?id=123") == .netease)
         precondition(PlaylistSource.identify("分享张国荣的专辑《REMEMBRANCE Leslie》https://163cn.tv/bjJ68pFq (@网易云音乐)") == .netease)
         precondition(PlaylistSource.identify("https://music.163.com/album?id=162353328") == .netease)
+        precondition(PlaylistSource.identify("https://music.163.com/song?id=456") == .netease)
+        precondition(PlaylistSource.identify("https://music.163.com/#/song?id=456") == .netease)
+        precondition(PlaylistSource.identify("https://music.apple.com/cn/song/example/123456") == .apple)
+        precondition(PlaylistSource.identify("https://music.apple.com/cn/album/example/123456?i=789") == .apple)
         let albumJSON = Data("""
         {"code":200,"album":{"id":162353328,"name":"REMEMBRANCE Leslie","size":2,"picUrl":"https://example.com/a.jpg"},"songs":[{"name":"第一首","ar":[{"name":"张国荣"}]},{"name":"第二首","ar":[{"name":"张国荣"}]}]}
         """.utf8)
         let album = try PlaylistSelection.parseAlbum(albumJSON, id: "162353328")
         precondition(album.name == "REMEMBRANCE Leslie" && album.tracks.map(\.title) == ["第一首", "第二首"])
         do { _ = try PlaylistSelection.parseAlbum(albumJSON, id: "1"); preconditionFailure("Wrong album accepted") } catch {}
+        let songJSON = Data("""
+        {"code":200,"songs":[{"id":456,"name":"单曲一首","ar":[{"name":"歌手甲"}],"al":{"name":"某专辑","picUrl":"https://example.com/s.jpg"},"dt":123000}]}
+        """.utf8)
+        let song = try PlaylistSelection.parseSong(songJSON, id: "456")
+        precondition(song.name == "单曲一首" && song.tracks.count == 1 && song.tracks[0].neteaseID == "456" && song.tracks[0].durationMs == 123000)
+        do { _ = try PlaylistSelection.parseSong(songJSON, id: "1"); preconditionFailure("Wrong song accepted") } catch {}
         for value in ["https://music.apple.com.attacker.example/cn/playlist/x/pl.abc", "https://music.apple.com@attacker.example/playlist/pl.abc", "file:///tmp/playlist", "https://music.apple.com/cn/album/x/123", "https://example.com/playlist/123"] {
             precondition(PlaylistSource.identify(value) == nil)
         }

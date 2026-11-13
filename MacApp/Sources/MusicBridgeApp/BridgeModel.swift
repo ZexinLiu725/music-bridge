@@ -25,12 +25,24 @@ enum PlaylistSource: Equatable {
               let host = url.host?.lowercased(), url.user == nil, url.password == nil else { return nil }
         if host == "music.apple.com", url.path.contains("/playlist/"),
            url.pathComponents.contains(where: { $0.hasPrefix("pl.") && $0.count > 3 }) { return .apple }
-        if host == "music.163.com", ["playlist", "album"].contains(where: { url.path.contains($0) || (url.fragment ?? "").contains($0) }) { return .netease }
+        if host == "music.apple.com", isAppleSongURL(url) { return .apple }
+        if host == "music.163.com", ["playlist", "album", "song"].contains(where: { url.path.contains($0) || (url.fragment ?? "").contains($0) }) { return .netease }
         if host == "163cn.tv" { return .netease }
         if ["y.qq.com", "i.y.qq.com", "i2.y.qq.com"].contains(host),
            url.path.contains("playlist") || url.path.contains("playsquare") { return .qq }
         if host.hasSuffix("kugou.com"), url.path.contains("/special/") { return .kugou }
         return nil
+    }
+
+    /// An Apple Music song link: either the /song/ form, or an album
+    /// link whose ?i= query names the track. An album link without
+    /// ?i= stays unrecognized — a whole album is not a single.
+    static func isAppleSongURL(_ url: URL) -> Bool {
+        guard url.host?.lowercased() == "music.apple.com" else { return false }
+        if url.path.contains("/song/") { return true }
+        guard url.path.contains("/album/") else { return false }
+        return (URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? [])
+            .contains { $0.name == "i" && !($0.value ?? "").isEmpty }
     }
 }
 
@@ -125,6 +137,9 @@ final class BridgeModel: ObservableObject {
     @Published var ipodCover256: Bool {
         didSet { preferences.set(ipodCover256, forKey: "ipodCover256") }
     }
+    /// True once the Apple download service has ever reported ready on
+    /// this machine; the first-run login guidance keys off it.
+    @Published private(set) var appleServiceSeenReady = false
     @Published var fallbackEnabled: Bool {
         didSet { preferences.set(fallbackEnabled, forKey: "fallbackSourceEnabled") }
     }
@@ -151,6 +166,8 @@ final class BridgeModel: ObservableObject {
     private var jobCurrentIndex: Int?
     private var jobBaseline: [URL: FileSignature] = [:]
     private var songWatchdog: Task<Void, Never>?
+    private var appleLoginPoll: Task<Void, Never>?
+    private var appleServiceProcess: Process?
     private var songTimedOut = false
     private var lastDownloadActivity = Date()
     private let preferences: UserDefaults
@@ -174,6 +191,7 @@ final class BridgeModel: ObservableObject {
         usesSystemDeviceProvider = deviceProvider == nil
         originalCover = preferences.object(forKey: "originalCover") as? Bool ?? true
         ipodCover256 = preferences.object(forKey: "ipodCover256") as? Bool ?? true
+        appleServiceSeenReady = preferences.bool(forKey: "appleServiceWasReady")
         fallbackEnabled = preferences.object(forKey: "fallbackSourceEnabled") as? Bool ?? true
         downloadStrategy = DownloadStrategy(rawValue: preferences.string(forKey: "downloadStrategy") ?? "") ?? .appleFirst
         // Default to the 48 kHz lossless tier: higher sample rates stutter on
@@ -212,6 +230,7 @@ final class BridgeModel: ObservableObject {
         if neteaseCookieHeader != nil {
             Task { @MainActor in await self.refreshNeteaseAccount() }
         }
+        Task { @MainActor in await self.checkService() }
     }
 
     var canImport: Bool { device?.canImport == true && !deviceIOFailure && !loadingLocalState && !busy && !importing && !shutDown }
@@ -585,6 +604,10 @@ final class BridgeModel: ObservableObject {
             guard !shutDown else { return }
             let status = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             wrapperReady = (response as? HTTPURLResponse)?.statusCode == 200 && (status?["code"] as? Int) == 0
+            if wrapperReady, !appleServiceSeenReady {
+                appleServiceSeenReady = true
+                preferences.set(true, forKey: "appleServiceWasReady")
+            }
             connectionDetail = wrapperReady ? "本地下载服务已就绪 · 组件齐全" : "服务响应异常；点击开始后将重试"
         } catch {
             guard !shutDown else { return }
@@ -593,11 +616,80 @@ final class BridgeModel: ObservableObject {
         }
     }
 
+    /// Opens a Terminal window running the wrapper's interactive login
+    /// script: Apple ID, password and any 2FA code are typed into the
+    /// terminal and go only to Apple — the app never sees or stores
+    /// them. A poll then starts the local service and watches /status
+    /// until the fresh login reports ready.
+    func openAppleLogin() {
+        let wrapperDir = root.appendingPathComponent("work/wrapper-lite-macos")
+        guard FileManager.default.fileExists(atPath: wrapperDir.appendingPathComponent("login-local.sh").path) else {
+            fail("找不到登录脚本", "work/wrapper-lite-macos/login-local.sh 不在项目文件夹里。")
+            return
+        }
+        let commandURL = wrapperDir.appendingPathComponent("login-apple.command")
+        let script = """
+        #!/bin/zsh
+        cd "\(wrapperDir.path)"
+        ./login-local.sh
+        echo ""
+        echo "登录流程结束。回到 Music Bridge，状态变绿就能开始下载；这个窗口可以关掉。"
+        """
+        do {
+            try script.write(to: commandURL, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: commandURL.path)
+        } catch {
+            fail("打不开登录终端", error.localizedDescription)
+            return
+        }
+        NSWorkspace.shared.open(commandURL)
+        log("已打开终端进行 Apple 登录：在终端里输入 Apple ID、密码和验证码，完成后回到这里。")
+        appleLoginPoll?.cancel()
+        appleLoginPoll = Task { [weak self] in
+            var serviceKickDone = false
+            for _ in 0..<60 {
+                guard let self, !Task.isCancelled, !self.shutDown else { return }
+                await self.checkService()
+                if self.wrapperReady {
+                    self.log("Apple 登录完成，下载服务已就绪。")
+                    return
+                }
+                if !serviceKickDone {
+                    serviceKickDone = true
+                    self.ensureAppleServiceRunning()
+                }
+                try? await Task.sleep(for: .seconds(5))
+            }
+            self?.log("还没检测到登录完成；登好之后点「检查状态」，或直接开始下载。")
+        }
+    }
+
+    /// Starts the local wrapper service when it is not already running,
+    /// so a fresh login gets picked up without waiting for a download.
+    /// A service the downloader started itself is left alone — the
+    /// status probe sees it first.
+    private func ensureAppleServiceRunning() {
+        if appleServiceProcess?.isRunning == true { return }
+        let startScript = root.appendingPathComponent("work/wrapper-lite-macos/start-local.sh")
+        guard FileManager.default.fileExists(atPath: startScript.path) else { return }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = [startScript.path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            appleServiceProcess = process
+        } catch {
+            log("解密服务启动失败：\(error.localizedDescription)")
+        }
+    }
+
     func startOrStop() {
         guard !importing, !loadingLocalState, !shutDown else { return }
         if busy { stop(); return }
         guard let platform = PlaylistSource.identify(source) else {
-            fail("链接暂不识别", "可读取网易云、QQ 音乐、酷狗的歌单链接；也可粘贴 music.apple.com 公开歌单链接。")
+            fail("链接暂不识别", "可粘贴网易云、QQ 音乐、酷狗歌单链接、网易云专辑链接，以及网易云和 Apple Music 的单曲链接、Apple Music 公开歌单链接。")
             return
         }
         busy = true; failed = false; percent = 0; completed = 0; skipped = 0; queue = nil
@@ -717,9 +809,10 @@ final class BridgeModel: ObservableObject {
                         }
                     }
                 } else {
-                    downloadJob = DownloadJob(id: "apple-\(UUID().uuidString)", name: "Apple Music 歌单",
+                    let isSong = PlaylistSource.isAppleSongURL(link)
+                    downloadJob = DownloadJob(id: "apple-\(UUID().uuidString)", name: isSong ? "Apple Music 单曲" : "Apple Music 歌单",
                                               sourceURL: text, createdAt: Date(), updatedAt: Date(),
-                                              entries: [DownloadJobEntry(title: "歌单", artist: "", url: text, state: .pending)])
+                                              entries: [DownloadJobEntry(title: isSong ? "单曲" : "歌单", artist: "", url: text, state: .pending)])
                     queue = 1
                     persistJob()
                 }
@@ -1147,6 +1240,7 @@ final class BridgeModel: ObservableObject {
                     log("已生成通用播放列表（.m3u8）：\(playlistCount) 首，其他播放器打开歌单文件夹即可使用。")
                 }
             }
+            phase = "正在核对文件"
             let rateCap = quality.maximumSampleRate
             let healthWarnings = await Task.detached(priority: .utility) { () -> [String] in
                 var warnings: [String] = []
@@ -1296,7 +1390,8 @@ final class BridgeModel: ObservableObject {
                             suffix += 1
                         }
                         usedNames.insert(candidate.lowercased())
-                        try NcmTagWriter.tagged(song).write(to: folder.appendingPathComponent(candidate + "." + song.format))
+                        let fileURL = folder.appendingPathComponent(candidate + "." + song.format)
+                        try NcmTagWriter.tagged(song).write(to: fileURL)
                         if let cover = song.cover, !cover.isEmpty {
                             let coverURL = folder.appendingPathComponent(candidate + (song.coverMIME == "image/png" ? ".png" : ".jpg"))
                             try? cover.write(to: coverURL)
@@ -1805,7 +1900,7 @@ final class BridgeModel: ObservableObject {
         deviceScanToken = UUID(); deviceScan?.cancel()
         localStateRestore?.cancel()
         localStateRestoreToken = UUID()
-        workflow?.cancel(); runner.stop()
+        workflow?.cancel(); runner.stop(); appleLoginPoll?.cancel()
         progressMonitor?.cancel()
         observations.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
         observations.removeAll()
