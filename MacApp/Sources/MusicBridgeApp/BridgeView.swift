@@ -237,7 +237,7 @@ struct BridgeView: View {
                 .font(.system(size: 20)).foregroundStyle(Paint.blue)
             VStack(alignment: .leading, spacing: 3) {
                 Text("先登录一次 Apple 账号").font(.system(size: 13, weight: .semibold))
-                Text("下载 Apple Music 前要完成一次登录：在打开的终端里输账号和密码，App 不保存。登过一次之后就不用再管。")
+                Text("下载 Apple Music 前要完成一次登录：会自动打开一个登录窗口，在里面输账号和密码，App 不保存。登过一次之后就不用再管。")
                     .font(.system(size: 12)).foregroundStyle(Paint.secondary)
                 if let note = model.appleLoginNote {
                     Text(note).font(.system(size: 12, weight: .medium)).foregroundStyle(Paint.blue)

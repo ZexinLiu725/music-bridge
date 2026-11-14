@@ -661,6 +661,11 @@ final class BridgeModel: ObservableObject {
         let script = """
         #!/bin/zsh
         cd "\(wrapperDir.path)"
+        echo "接下来在这个窗口里完成 Apple 登录，一共三步："
+        echo "1）输入 Apple ID，按回车；"
+        echo "2）输入密码，按回车（输密码时屏幕上不会显示字符，这是正常的）；"
+        echo "3）如果 Apple 要二次验证，把受信任设备或手机短信收到的验证码输入这里，按回车。"
+        echo ""
         ./login-local.sh
         echo ""
         echo "登录流程结束。回到 Music Bridge，状态变绿就能开始下载；这个窗口可以关掉。"
@@ -670,16 +675,16 @@ final class BridgeModel: ObservableObject {
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: commandURL.path)
         } catch {
             appleLoginNote = "登录脚本创建失败：\(error.localizedDescription)"
-            fail("打不开登录终端", error.localizedDescription)
+            fail("登录窗口没能打开", error.localizedDescription)
             return
         }
         guard NSWorkspace.shared.open(commandURL) else {
-            appleLoginNote = "终端没能打开。请检查终端 App 是否可用，或手动双击项目文件夹里 work/wrapper-lite-macos/login-apple.command 完成登录。"
-            fail("打不开登录终端", "系统未能打开 login-apple.command。")
+            appleLoginNote = "登录窗口没能打开。你可以手动双击项目文件夹里 work/wrapper-lite-macos/login-apple.command 完成登录。"
+            fail("登录窗口没能打开", "系统未能打开 login-apple.command。")
             return
         }
-        appleLoginNote = "终端已打开：在终端里输 Apple ID 和密码；如果 Apple 要二次验证，验证码由 Apple 发送到该账号的受信任设备或绑定的手机号，把收到的验证码输回终端即可。完成后回到这里，状态会自动变绿。"
-        log("已打开终端进行 Apple 登录：在终端里输入 Apple ID、密码和验证码，完成后回到这里。")
+        appleLoginNote = "登录窗口已打开：在那个窗口里输 Apple ID 和密码（输密码时屏幕不显示字符，是正常的）；如果 Apple 要二次验证，验证码会发到该账号的受信任设备或绑定手机号，把它输回那个窗口就行。完成后回到这里，状态会自动变绿。"
+        log("已打开登录窗口：在窗口里输入 Apple ID、密码和验证码，完成后回到这里。")
         appleLoginPoll?.cancel()
         appleLoginPoll = Task { [weak self] in
             var serviceKickDone = false
