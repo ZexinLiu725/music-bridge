@@ -12,10 +12,17 @@ enum PlaylistSource: Equatable {
             guard let range = Range(match.range, in: trimmed) else { continue }
             let raw = String(trimmed[range]).trimmingCharacters(in: CharacterSet(charactersIn: ".,;!?)"))
             if let url = URL(string: raw), let host = url.host?.lowercased(),
-               ["music.163.com", "163cn.tv", "music.apple.com",
+               ["music.163.com", "163cn.tv", "music.apple.com", "itunes.apple.com",
                 "y.qq.com", "i.y.qq.com", "i2.y.qq.com",
                 "www.kugou.com", "m.kugou.com", "kugou.com"].contains(host),
-               url.user == nil, url.password == nil { return url }
+               url.user == nil, url.password == nil {
+                if host == "itunes.apple.com",
+                   var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+                    components.host = "music.apple.com"
+                    if let normalized = components.url { return normalized }
+                }
+                return url
+            }
         }
         return nil
     }
@@ -671,7 +678,7 @@ final class BridgeModel: ObservableObject {
             fail("打不开登录终端", "系统未能打开 login-apple.command。")
             return
         }
-        appleLoginNote = "终端已打开：在终端里输 Apple ID、密码和验证码，完成后回到这里，状态会自动变绿。"
+        appleLoginNote = "终端已打开：在终端里输 Apple ID 和密码；如果 Apple 要二次验证，验证码由 Apple 发送到该账号的受信任设备或绑定的手机号，把收到的验证码输回终端即可。完成后回到这里，状态会自动变绿。"
         log("已打开终端进行 Apple 登录：在终端里输入 Apple ID、密码和验证码，完成后回到这里。")
         appleLoginPoll?.cancel()
         appleLoginPoll = Task { [weak self] in
