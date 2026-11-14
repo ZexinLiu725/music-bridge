@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import SwiftUI
 
 enum PlaylistSource: Equatable {
@@ -140,6 +141,17 @@ final class BridgeModel: ObservableObject {
     /// True once the Apple download service has ever reported ready on
     /// this machine; the first-run login guidance keys off it.
     @Published private(set) var appleServiceSeenReady = false
+    /// Last outcome of an Apple login attempt, shown right where the
+    /// login buttons live (settings card and download banner) so a
+    /// click can never fail silently onto another page.
+    @Published private(set) var appleLoginNote: String?
+    /// True when the downloader or the wrapper is not in place yet;
+    /// the login surfaces then offer one-tap provisioning instead of
+    /// sending the user off to fetch files by hand.
+    @Published private(set) var componentsMissing = false
+    /// True while the components pack is being downloaded or laid down.
+    @Published private(set) var provisioning = false
+    private var provisionTask: Task<Void, Never>?
     @Published var fallbackEnabled: Bool {
         didSet { preferences.set(fallbackEnabled, forKey: "fallbackSourceEnabled") }
     }
@@ -592,9 +604,14 @@ final class BridgeModel: ObservableObject {
         var missing: [String] = []
         if !files.isExecutableFile(atPath: root.appendingPathComponent("amdl").path) { missing.append("下载器 amdl") }
         if !files.fileExists(atPath: root.appendingPathComponent("work/wrapper-lite-macos/start-local.sh").path) { missing.append("解密服务启动脚本") }
+        componentsMissing = !missing.isEmpty || !files.fileExists(atPath: root.appendingPathComponent("work/wrapper-lite-macos/login-local.sh").path)
         if !missing.isEmpty {
             wrapperReady = false
             connectionDetail = "组件缺失：\(missing.joined(separator: "、"))"
+            if appleLoginNote == nil,
+               !files.fileExists(atPath: root.appendingPathComponent("work/wrapper-lite-macos/login-local.sh").path) {
+                appleLoginNote = "没找到登录组件：Music Bridge 的仓库不含 wrapper 本体，需要先按 README 的「配置下载」一节，把 wrapper-lite 放到项目文件夹的 work/wrapper-lite-macos 里，再回来点登录。"
+            }
             return
         }
         do {
@@ -604,6 +621,7 @@ final class BridgeModel: ObservableObject {
             guard !shutDown else { return }
             let status = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             wrapperReady = (response as? HTTPURLResponse)?.statusCode == 200 && (status?["code"] as? Int) == 0
+            if wrapperReady { appleLoginNote = nil }
             if wrapperReady, !appleServiceSeenReady {
                 appleServiceSeenReady = true
                 preferences.set(true, forKey: "appleServiceWasReady")
@@ -613,6 +631,10 @@ final class BridgeModel: ObservableObject {
             guard !shutDown else { return }
             wrapperReady = false
             connectionDetail = "服务尚未启动；点击开始后自动启动"
+            if appleLoginNote == nil,
+               !FileManager.default.fileExists(atPath: root.appendingPathComponent("work/wrapper-lite-macos/login-local.sh").path) {
+                appleLoginNote = "没找到登录组件：Music Bridge 的仓库不含 wrapper 本体，需要先按 README 的「配置下载」一节，把 wrapper-lite 放到项目文件夹的 work/wrapper-lite-macos 里，再回来点登录。"
+            }
         }
     }
 
@@ -624,6 +646,7 @@ final class BridgeModel: ObservableObject {
     func openAppleLogin() {
         let wrapperDir = root.appendingPathComponent("work/wrapper-lite-macos")
         guard FileManager.default.fileExists(atPath: wrapperDir.appendingPathComponent("login-local.sh").path) else {
+            appleLoginNote = "没找到登录组件：Music Bridge 的仓库不含 wrapper 本体，需要先按 README 的「配置下载」一节，把 wrapper-lite 放到项目文件夹的 work/wrapper-lite-macos 里，再回来点登录。"
             fail("找不到登录脚本", "work/wrapper-lite-macos/login-local.sh 不在项目文件夹里。")
             return
         }
@@ -639,10 +662,16 @@ final class BridgeModel: ObservableObject {
             try script.write(to: commandURL, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: commandURL.path)
         } catch {
+            appleLoginNote = "登录脚本创建失败：\(error.localizedDescription)"
             fail("打不开登录终端", error.localizedDescription)
             return
         }
-        NSWorkspace.shared.open(commandURL)
+        guard NSWorkspace.shared.open(commandURL) else {
+            appleLoginNote = "终端没能打开。请检查终端 App 是否可用，或手动双击项目文件夹里 work/wrapper-lite-macos/login-apple.command 完成登录。"
+            fail("打不开登录终端", "系统未能打开 login-apple.command。")
+            return
+        }
+        appleLoginNote = "终端已打开：在终端里输 Apple ID、密码和验证码，完成后回到这里，状态会自动变绿。"
         log("已打开终端进行 Apple 登录：在终端里输入 Apple ID、密码和验证码，完成后回到这里。")
         appleLoginPoll?.cancel()
         appleLoginPoll = Task { [weak self] in
@@ -651,6 +680,7 @@ final class BridgeModel: ObservableObject {
                 guard let self, !Task.isCancelled, !self.shutDown else { return }
                 await self.checkService()
                 if self.wrapperReady {
+                    self.appleLoginNote = nil
                     self.log("Apple 登录完成，下载服务已就绪。")
                     return
                 }
@@ -660,6 +690,7 @@ final class BridgeModel: ObservableObject {
                 }
                 try? await Task.sleep(for: .seconds(5))
             }
+            self?.appleLoginNote = "还没检测到登录完成；登好之后点「检查状态」，或直接开始下载。"
             self?.log("还没检测到登录完成；登好之后点「检查状态」，或直接开始下载。")
         }
     }
@@ -683,6 +714,103 @@ final class BridgeModel: ObservableObject {
         } catch {
             log("解密服务启动失败：\(error.localizedDescription)")
         }
+    }
+
+    /// Downloads the pristine components pack (downloader + wrapper,
+    /// no login state) from the project's GitHub release and lays it
+    /// down where the rest of the app expects it, so a fresh install
+    /// needs no manual file hunting. The pack's SHA-256 is pinned in
+    /// the source; a mismatch aborts before anything is moved. An
+    /// existing login state (qemu/data.img) is preserved across a
+    /// re-provision.
+    func provisionComponents() {
+        guard !provisioning else { return }
+        provisioning = true
+        appleLoginNote = "正在下载组件包…"
+        provisionTask?.cancel()
+        provisionTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.downloadAndInstallComponents()
+                self.provisioning = false
+                self.appleLoginNote = "组件已备齐，现在点「登录 Apple 账号」就能登录了。"
+                self.log("组件包已下载并安装完成。")
+                await self.checkService()
+            } catch {
+                self.provisioning = false
+                self.appleLoginNote = "组件没能备齐：\(error.localizedDescription)。检查网络后再点一次「一键备齐组件」。"
+                self.log("组件安装失败：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func downloadAndInstallComponents() async throws {
+        let packURL = URL(string: "https://github.com/ZexinLiu725/music-bridge/releases/download/components-1/music-bridge-components.zip")!
+        let expectedSHA256 = "119bec72eb1e3f6d661994ba3c3a5b9caa9be05513eb0ed215fcc20cbf8202dc"
+        let fm = FileManager.default
+        let staging = fm.temporaryDirectory.appendingPathComponent("music-bridge-components-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: staging) }
+        let zipURL = staging.appendingPathComponent("components.zip")
+        let (downloaded, response) = try await URLSession.shared.download(from: packURL)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw NSError(domain: "MusicBridge", code: 1, userInfo: [NSLocalizedDescriptionKey: "组件包下载失败（服务器没有返回文件）"])
+        }
+        try fm.moveItem(at: downloaded, to: zipURL)
+        appleLoginNote = "组件包下载完成，正在校验安装…"
+        if !expectedSHA256.isEmpty, expectedSHA256 != "COMPONENTS_SHA256_PLACEHOLDER" {
+            let digest = try sha256Hex(of: zipURL)
+            guard digest == expectedSHA256 else {
+                throw NSError(domain: "MusicBridge", code: 2, userInfo: [NSLocalizedDescriptionKey: "组件包校验不通过，已放弃安装"])
+            }
+        }
+        let extracted = staging.appendingPathComponent("extracted", isDirectory: true)
+        try fm.createDirectory(at: extracted, withIntermediateDirectories: true)
+        let ditto = Process()
+        ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        ditto.arguments = ["-x", "-k", zipURL.path, extracted.path]
+        try ditto.run()
+        ditto.waitUntilExit()
+        guard ditto.terminationStatus == 0 else {
+            throw NSError(domain: "MusicBridge", code: 3, userInfo: [NSLocalizedDescriptionKey: "组件包解压失败"])
+        }
+        let packedAmdl = extracted.appendingPathComponent("amdl")
+        let packedWrapper = extracted.appendingPathComponent("wrapper-lite-macos")
+        guard fm.fileExists(atPath: packedAmdl.path), fm.fileExists(atPath: packedWrapper.path) else {
+            throw NSError(domain: "MusicBridge", code: 4, userInfo: [NSLocalizedDescriptionKey: "组件包内容不完整"])
+        }
+        let targetAmdl = root.appendingPathComponent("amdl")
+        if fm.fileExists(atPath: targetAmdl.path) { try fm.removeItem(at: targetAmdl) }
+        try fm.copyItem(at: packedAmdl, to: targetAmdl)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: targetAmdl.path)
+        let workDir = root.appendingPathComponent("work", isDirectory: true)
+        try fm.createDirectory(at: workDir, withIntermediateDirectories: true)
+        let targetWrapper = workDir.appendingPathComponent("wrapper-lite-macos", isDirectory: true)
+        let savedData = staging.appendingPathComponent("saved-data", isDirectory: true)
+        try fm.createDirectory(at: savedData, withIntermediateDirectories: true)
+        let liveData = targetWrapper.appendingPathComponent("qemu/data.img")
+        let liveDataPrev = targetWrapper.appendingPathComponent("qemu/data.img.previous")
+        let hadData = fm.fileExists(atPath: liveData.path)
+        if hadData { try fm.copyItem(at: liveData, to: savedData.appendingPathComponent("data.img")) }
+        if fm.fileExists(atPath: liveDataPrev.path) { try? fm.copyItem(at: liveDataPrev, to: savedData.appendingPathComponent("data.img.previous")) }
+        if fm.fileExists(atPath: targetWrapper.path) { try fm.removeItem(at: targetWrapper) }
+        try fm.copyItem(at: packedWrapper, to: targetWrapper)
+        if hadData {
+            let qemuDir = targetWrapper.appendingPathComponent("qemu", isDirectory: true)
+            try fm.copyItem(at: savedData.appendingPathComponent("data.img"), to: qemuDir.appendingPathComponent("data.img"))
+            let prev = savedData.appendingPathComponent("data.img.previous")
+            if fm.fileExists(atPath: prev.path) { try? fm.copyItem(at: prev, to: qemuDir.appendingPathComponent("data.img.previous")) }
+        }
+    }
+
+    private func sha256Hex(of file: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: file)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     func startOrStop() {

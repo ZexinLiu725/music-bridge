@@ -96,6 +96,13 @@ struct SettingsPage: View {
             }
             Text("下载 Apple Music 要先用 Apple 账号登录一次。点登录会打开终端，账号、密码和验证码只在终端里输给 Apple，Music Bridge 不保存；登录完成回到这里，状态会自动变绿。")
                 .font(.system(size: 12)).foregroundStyle(Paint.secondary).lineSpacing(3)
+            if let note = model.appleLoginNote {
+                Text(note).font(.system(size: 12, weight: .medium)).foregroundStyle(Paint.blue).lineSpacing(3)
+            }
+            if model.componentsMissing {
+                Button(model.provisioning ? "正在备齐组件…" : "一键备齐组件") { model.provisionComponents() }
+                    .disabled(model.provisioning)
+            }
         }
         .padding(23)
         .frame(maxWidth: .infinity, alignment: .leading)

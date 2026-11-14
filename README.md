@@ -47,7 +47,9 @@ The script creates and opens `dist/MusicBridgeApp.app`. Building the interface d
 
 ## Configure downloads
 
-Install and configure the external [amdl downloader](https://github.com/zhaarey/apple-music-downloader) and [wrapper-lite service](https://github.com/WorldObservationLog/wrapper/tree/lite) using their upstream instructions. The app expects these paths relative to the project root:
+The easy way: open **Settings （设置）** and click **一键备齐组件 (Provision components)** in the Apple account card. The app downloads a pinned, SHA-256-verified components pack (the amdl downloader plus wrapper-lite, with no login state) from this repository's `components-1` release and lays it down automatically; an existing wrapper login (`qemu/data.img`) is preserved. Then click **登录 Apple 账号** and sign in once in the Terminal window that opens.
+
+To place the same files by hand instead, install and configure the external [amdl downloader](https://github.com/zhaarey/apple-music-downloader) and [wrapper-lite service](https://github.com/WorldObservationLog/wrapper/tree/lite) using their upstream instructions. The app expects these paths relative to the project root:
 
 | Path | Purpose |
 | --- | --- |

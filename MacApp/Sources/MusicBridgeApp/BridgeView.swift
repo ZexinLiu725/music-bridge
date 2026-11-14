@@ -239,6 +239,13 @@ struct BridgeView: View {
                 Text("先登录一次 Apple 账号").font(.system(size: 13, weight: .semibold))
                 Text("下载 Apple Music 前要完成一次登录：在打开的终端里输账号和密码，App 不保存。登过一次之后就不用再管。")
                     .font(.system(size: 12)).foregroundStyle(Paint.secondary)
+                if let note = model.appleLoginNote {
+                    Text(note).font(.system(size: 12, weight: .medium)).foregroundStyle(Paint.blue)
+                }
+                if model.componentsMissing {
+                    Button(model.provisioning ? "正在备齐组件…" : "一键备齐组件") { model.provisionComponents() }
+                        .disabled(model.provisioning)
+                }
             }
             Spacer(minLength: 0)
             Button("登录 Apple 账号") { model.openAppleLogin() }
