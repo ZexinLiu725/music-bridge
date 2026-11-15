@@ -21,7 +21,7 @@ English · [简体中文](README.zh-CN.md)
 ## Get started (prebuilt app, no building)
 
 1. Open this repository's [Releases page](https://github.com/ZexinLiu725/music-bridge/releases/latest) and download `MusicBridgeApp.zip` from the release marked **Latest**.
-2. Unzip it and drag `MusicBridgeApp` into your Applications folder; do not run it from inside the zip. On first launch, **right-click it and choose Open**: it is ad-hoc signed, so macOS blocks the first double-click; after one right-click open it launches normally.
+2. Unzip it and put `MusicBridgeApp` on your Desktop (or inside any folder in your home directory), then open it from there. Do not run it from inside the zip or a disk image, and do not drag it into the system Applications folder: the app keeps its working files in the folders above it, and those locations are not writable for it. On first launch, **right-click it and choose Open**: it is ad-hoc signed, so macOS blocks the first double-click; after one right-click open it launches normally.
 3. In the app, open **Settings （设置）** and click **一键备齐组件 (Provision components)** in the Apple account card. Wait for the automatic download and verification to finish; you do not need to download anything by hand.
 4. Click **登录 Apple 账号 (Sign in to Apple account)**. A login window opens and prints three steps: type your Apple ID and press Return, type your password and press Return, then type the verification code and press Return. Note: **nothing appears on screen while you type your password; that is normal** — just press Return when done. The code arrives on a trusted device or by text message.
 5. Back on the Download page, paste a NetEase Cloud Music or Apple Music playlist link and start the download.
