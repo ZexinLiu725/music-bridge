@@ -1,5 +1,12 @@
 import Foundation
 
+extension Notification.Name {
+    static let mbGoDownload = Notification.Name("MusicBridgeGoDownload")
+    static let mbGoImport = Notification.Name("MusicBridgeGoImport")
+    static let mbGoDecode = Notification.Name("MusicBridgeGoDecode")
+    static let mbGoSettings = Notification.Name("MusicBridgeGoSettings")
+}
+
 struct OutputLineBuffer {
     private var pending = Data()
     private let limit = 65_536
