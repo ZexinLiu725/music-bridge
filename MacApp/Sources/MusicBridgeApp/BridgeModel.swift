@@ -34,6 +34,7 @@ enum PlaylistSource: Equatable {
         if host == "music.apple.com", url.path.contains("/playlist/"),
            url.pathComponents.contains(where: { $0.hasPrefix("pl.") && $0.count > 3 }) { return .apple }
         if host == "music.apple.com", isAppleSongURL(url) { return .apple }
+        if host == "music.apple.com", isAppleAlbumURL(url) { return .apple }
         if host == "music.163.com", ["playlist", "album", "song"].contains(where: { url.path.contains($0) || (url.fragment ?? "").contains($0) }) { return .netease }
         if host == "163cn.tv" { return .netease }
         if ["y.qq.com", "i.y.qq.com", "i2.y.qq.com"].contains(host),
@@ -43,14 +44,23 @@ enum PlaylistSource: Equatable {
     }
 
     /// An Apple Music song link: either the /song/ form, or an album
-    /// link whose ?i= query names the track. An album link without
-    /// ?i= stays unrecognized — a whole album is not a single.
+    /// link whose ?i= query names the track.
     static func isAppleSongURL(_ url: URL) -> Bool {
         guard url.host?.lowercased() == "music.apple.com" else { return false }
         if url.path.contains("/song/") { return true }
         guard url.path.contains("/album/") else { return false }
         return (URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? [])
             .contains { $0.name == "i" && !($0.value ?? "").isEmpty }
+    }
+
+    /// An Apple Music album link without ?i=: the whole album. amdl
+    /// downloads every track from the album URL itself, the same way it
+    /// handles a playlist URL, so albums ride the direct-link path
+    /// alongside songs and playlists.
+    static func isAppleAlbumURL(_ url: URL) -> Bool {
+        guard url.host?.lowercased() == "music.apple.com" else { return false }
+        guard url.path.contains("/album/") else { return false }
+        return !isAppleSongURL(url)
     }
 }
 
@@ -829,7 +839,7 @@ final class BridgeModel: ObservableObject {
         guard !importing, !loadingLocalState, !shutDown else { return }
         if busy { stop(); return }
         guard let platform = PlaylistSource.identify(source) else {
-            fail("链接暂不识别", "可粘贴网易云、QQ 音乐、酷狗歌单链接、网易云专辑链接，以及网易云和 Apple Music 的单曲链接、Apple Music 公开歌单链接。")
+            fail("链接暂不识别", "可粘贴网易云、QQ 音乐、酷狗歌单链接、网易云专辑链接，以及网易云和 Apple Music 的单曲链接、Apple Music 专辑与公开歌单链接。")
             return
         }
         busy = true; failed = false; percent = 0; completed = 0; skipped = 0; queue = nil
@@ -950,9 +960,10 @@ final class BridgeModel: ObservableObject {
                     }
                 } else {
                     let isSong = PlaylistSource.isAppleSongURL(link)
-                    downloadJob = DownloadJob(id: "apple-\(UUID().uuidString)", name: isSong ? "Apple Music 单曲" : "Apple Music 歌单",
+                    let isAlbum = PlaylistSource.isAppleAlbumURL(link)
+                    downloadJob = DownloadJob(id: "apple-\(UUID().uuidString)", name: isSong ? "Apple Music 单曲" : (isAlbum ? "Apple Music 专辑" : "Apple Music 歌单"),
                                               sourceURL: text, createdAt: Date(), updatedAt: Date(),
-                                              entries: [DownloadJobEntry(title: isSong ? "单曲" : "歌单", artist: "", url: text, state: .pending)])
+                                              entries: [DownloadJobEntry(title: isSong ? "单曲" : (isAlbum ? "专辑" : "歌单"), artist: "", url: text, state: .pending)])
                     queue = 1
                     persistJob()
                 }
