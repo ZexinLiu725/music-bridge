@@ -1,13 +1,6 @@
 import AppKit
 import SwiftUI
 
-extension Notification.Name {
-    static let mbGoDownload = Notification.Name("MusicBridgeGoDownload")
-    static let mbGoImport = Notification.Name("MusicBridgeGoImport")
-    static let mbGoDecode = Notification.Name("MusicBridgeGoDecode")
-    static let mbGoSettings = Notification.Name("MusicBridgeGoSettings")
-}
-
 @main
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
@@ -23,7 +16,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let project = Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
+        let bundleRoot = Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
+        let project: URL
+        if FileManager.default.isWritableFile(atPath: bundleRoot.path) {
+            project = bundleRoot
+        } else {
+            // Launched from a read-only place (disk image, /Applications):
+            // keep the app's data in a fixed folder in the home directory
+            // instead of failing every write.
+            project = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("MusicBridge", isDirectory: true)
+            try? FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        }
         model = BridgeModel(root: project)
         installMenus()
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 640),

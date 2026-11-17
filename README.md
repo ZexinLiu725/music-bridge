@@ -18,6 +18,20 @@ English · [简体中文](README.zh-CN.md)
 
 ![Music Bridge promo: three steps, playlists into your iPod](docs/screenshots/music-bridge-promo-3-flow.jpg)
 
+## Get started (prebuilt app, no building)
+
+1. Open this repository's [Releases page](https://github.com/ZexinLiu725/music-bridge/releases/latest) and download `MusicBridgeApp.zip` from the release marked **Latest**.
+2. Unzip it and put `MusicBridgeApp` wherever you like — your Desktop, a folder in your home directory, or the system Applications folder — then open it from there. The app stores its components in a fixed system location, so where the app itself lives no longer matters. On first launch, **right-click it and choose Open**: it is ad-hoc signed, so macOS blocks the first double-click; after one right-click open it launches normally.
+3. In the app, open **Settings （设置）** and click **一键备齐组件 (Provision components)** in the Apple account card. Wait for the automatic download and verification to finish; you do not need to download anything by hand.
+4. Click **登录 Apple 账号 (Sign in to Apple account)**. A login window opens and prints three steps: type your Apple ID and press Return, type your password and press Return, then type the verification code and press Return. Note: **nothing appears on screen while you type your password; that is normal** — just press Return when done. The code arrives on a trusted device or by text message.
+5. Back on the Download page, paste a NetEase Cloud Music or Apple Music playlist link and start the download.
+6. Connect your iPod by cable, go to the Import page, pick a mode (choose Auto if unsure), review the preview, then confirm. Safely eject the iPod afterward and check playback on the device.
+
+If something goes wrong, check these first:
+
+- A component verification failure usually means an old app build. Download the newest app from Releases again; the app and the components pack are a matched pair.
+- Sign-in failures and missing verification codes are on Apple's side (two-factor authentication, account state). Make sure the account signs in on the web first, then try again in the app.
+
 ## Features
 
 - **Chinese-player playlist migration:** currently reads public music.163.com playlists and matches them to the Apple Music China catalog, or accepts Apple Music public playlists directly. Uncertain versions are skipped.
@@ -43,11 +57,11 @@ If project records are waiting for macOS file access, use **选择项目文件�
 bash script/build_and_run.sh --verify
 ```
 
-The script creates and opens `dist/MusicBridgeApp.app`. Building the interface does not require a download service. The app is not Developer ID signed or notarized, and this repository does not provide an installer.
+The script creates and opens `dist/MusicBridgeApp.app`. Building the interface does not require a download service. The app is ad-hoc signed and not notarized; there is no installer, but a prebuilt app zip is provided on the Releases page (see Get started above).
 
 ## Configure downloads
 
-The easy way: open **Settings （设置）** and click **一键备齐组件 (Provision components)** in the Apple account card. The app downloads a pinned, SHA-256-verified components pack (the amdl downloader plus wrapper-lite, with no login state) from this repository's `components-1` release and lays it down automatically; an existing wrapper login (`qemu/data.img`) is preserved. Then click **登录 Apple 账号** and sign in once in the Terminal window that opens.
+The easy way: open **Settings （设置）** and click **一键备齐组件 (Provision components)** in the Apple account card. The app downloads a pinned, SHA-256-verified components pack (the amdl downloader plus wrapper-lite, with no login state) from this repository's `components-2` release and lays it down automatically; an existing wrapper login (`qemu/data.img`) is preserved. Then click **登录 Apple 账号** and sign in once in the login window that opens.
 
 To place the same files by hand instead, install and configure the external [amdl downloader](https://github.com/zhaarey/apple-music-downloader) and [wrapper-lite service](https://github.com/WorldObservationLog/wrapper/tree/lite) using their upstream instructions. The app expects these paths relative to the project root:
 
